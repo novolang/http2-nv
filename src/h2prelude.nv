@@ -1,0 +1,265 @@
+// h2prelude.nv — the three ways a connection becomes HTTP/2, as values.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THERE ARE EXACTLY THREE, AND A CLIENT HAS TO CHOOSE ONE.  Over TLS,
+// ALPN negotiates `h2` and a server that did not offer it gets
+// HTTP/1.1 — this is what every browser and every public API does.
+// Without TLS, a client either KNOWS the server speaks HTTP/2 (prior
+// knowledge: it just sends the preface) or it asks over HTTP/1.1 with
+// an `Upgrade: h2c` header and hopes for a 101.  gRPC over a private
+// network uses prior knowledge; gRPC over the internet uses ALPN.
+//
+// h2c IS DEPRECATED AND STILL DEPLOYED.  RFC 9113 § 3.1 removed the
+// Upgrade mechanism that RFC 7540 § 3.2 defined; it is not in the
+// current specification.  It is in every service mesh, every reverse
+// proxy and every `curl --http2` against a plaintext endpoint, so the
+// package parses and writes it, and says here rather than in a footnote
+// that a new deployment should use prior knowledge instead.
+//
+// THE PREFACE IS 24 BYTES AND IT IS NOT A HANDSHAKE.  A client sends
+// `PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n` and then a SETTINGS frame,
+// immediately, without waiting for anything — the whole point of the
+// sequence is that it is a string no HTTP/1.1 server can mistake for a
+// request, so a server that is not speaking HTTP/2 fails loudly instead
+// of parsing something. A client that waited for the server's SETTINGS
+// before sending its own adds a round trip to every connection.
+//
+// NOTHING HERE PERFORMS ANYTHING.  Every row in this module is `[]`.
+
+use h2settings
+
+// The bytes of the client connection preface: 24.
+pub const H2_PREFACE_LEN = 24
+
+// The ALPN protocol identifier for HTTP/2 over TLS.
+//
+// A client that did not offer it gets an HTTP/1.1 connection from every
+// conforming server, and then fails on the first thing HTTP/1.1 cannot
+// carry.  grpc-nv declares the same string for the same reason; when
+// http2-nv is a dependency of grpc-nv, that one is the duplicate to
+// remove.
+pub const H2_ALPN_ID = "h2"
+
+// The `Upgrade` token for cleartext HTTP/2, RFC 7540 § 3.2.
+pub const H2_UPGRADE_TOKEN = "h2c"
+
+// The header an h2c upgrade request carries its SETTINGS in,
+// base64url-encoded without padding.
+pub const H2_SETTINGS_HEADER = "HTTP2-Settings"
+
+// How a connection became HTTP/2, as a value the connection keeps.
+//
+// The connection keeps it because two of the three change what it must
+// do next: an h2c upgrade means stream 1 is already half-open with the
+// upgraded request on it, and prior knowledge means there is no
+// negotiation to fail.
+pub enum H2Prelude
+    // ALPN negotiated `h2` over TLS.  Nothing to do but send the
+    // preface.
+    H2ViaAlpn
+    // The client knows and simply sends the preface.  RFC 9113 § 3.3.
+    H2ViaPriorKnowledge
+    // An HTTP/1.1 `Upgrade: h2c` was accepted with a 101, and the
+    // request that carried it IS stream 1 — already half-closed
+    // (remote), because its body arrived over HTTP/1.1 and there is no
+    // more of it coming.  An implementation that opened stream 1 fresh
+    // loses the request it was upgrading for.
+    H2ViaUpgrade
+
+// The twenty-four bytes a client sends first.
+//
+// ```novo
+// use std.list
+// use h2prelude
+//
+// fn main() [io]
+//     println("${list.len(h2prelude.connection_preface())}")
+// ```
+pub fn connection_preface() -> [u8] []
+    todo("http2-nv.h2prelude.connection_preface")
+
+// Do these bytes begin with the preface?
+//
+// Answers false for a short buffer as well as a wrong one, so a server
+// that has read three bytes asks again rather than refusing.
+// `preface_fault` is how it tells the two apart.
+//
+// ```novo
+// use h2prelude
+//
+// fn main() [io]
+//     println("${h2prelude.preface_ok(h2prelude.connection_preface())}")
+// ```
+pub fn preface_ok(src: [u8]) -> Bool []
+    todo("http2-nv.h2prelude.preface_ok")
+
+// The first byte at which these bytes DISAGREE with the preface, or
+// `None` when they agree as far as they go.
+//
+// The distinction a server needs and `preface_ok` cannot make: a
+// partial preface is a socket that has not finished arriving, and a
+// wrong one is an HTTP/1.1 client that should be told so.  § 3.4 says
+// a server MAY answer that client with an HTTP/1.1 400 rather than a
+// GOAWAY it will not understand.
+//
+// ```novo
+// use h2prelude
+//
+// fn main() [io]
+//     match h2prelude.preface_fault([0x50 as u8, 0x4F as u8])
+//         Some(at) => println("wrong at ${at}")
+//         None     => println("so far so good")
+// ```
+pub fn preface_fault(src: [u8]) -> ?Int []
+    todo("http2-nv.h2prelude.preface_fault")
+
+// What a client offers in ALPN: `h2` first, then `http/1.1`.
+//
+// Order is the offer's preference and servers honour it, so a list with
+// `http/1.1` first negotiates HTTP/1.1 against every server that
+// supports both — which is a one-line mistake with a symptom weeks
+// away.
+//
+// ```novo
+// use std.list
+// use h2prelude
+//
+// fn main() [io]
+//     println("${list.len(h2prelude.alpn_offer())}")
+// ```
+pub fn alpn_offer() -> [Str] []
+    todo("http2-nv.h2prelude.alpn_offer")
+
+// Did ALPN settle on HTTP/2?
+//
+// A function rather than a comparison at the call site, because the
+// negotiated protocol may be absent — a peer that offered nothing — and
+// the empty string is not `h2` but is also not an error.
+//
+// ```novo
+// use h2prelude
+//
+// fn main() [io]
+//     println("${h2prelude.alpn_chose_h2("h2")}")
+// ```
+pub fn alpn_chose_h2(negotiated: Str) -> Bool []
+    todo("http2-nv.h2prelude.alpn_chose_h2")
+
+// The SETTINGS payload — the parameters, six bytes each, with no frame
+// header.
+//
+// The payload alone, because that is what the `HTTP2-Settings` header
+// carries and what a caller building a frame around it already has a
+// header writer for.
+//
+// ```novo
+// use std.list
+// use h2prelude
+// use h2settings
+//
+// fn main() [io]
+//     println("${list.len(h2prelude.settings_payload(h2settings.default_settings()))}")
+// ```
+pub fn settings_payload(s: H2Settings) -> [u8] []
+    todo("http2-nv.h2prelude.settings_payload")
+
+// The `HTTP2-Settings` header value: the payload, base64url, unpadded.
+//
+// base64url and UNPADDED, both of which RFC 7540 § 3.2.1 requires and
+// both of which a caller reaching for a general base64 helper gets
+// wrong — standard base64 has `+` and `/`, which are not safe in a
+// header, and the padding `=` is refused by conforming servers.
+//
+// ```novo
+// use h2prelude
+// use h2settings
+//
+// fn main() [io]
+//     println(h2prelude.upgrade_settings_value(h2settings.default_settings()))
+// ```
+pub fn upgrade_settings_value(s: H2Settings) -> Str []
+    todo("http2-nv.h2prelude.upgrade_settings_value")
+
+// The settings an `HTTP2-Settings` header value carries.
+//
+// What a server accepting an h2c upgrade reads.  A value that is not
+// base64url, or that decodes to a length that is not a multiple of six,
+// is a fault rather than an empty settings set: the upgrade must be
+// refused, and a server that silently used its defaults would be using
+// different numbers from the client that is already sending against
+// them.
+//
+// ```novo
+// use h2prelude
+//
+// fn main() [io]
+//     match h2prelude.settings_of_upgrade_value("")
+//         Ok(s)  => println("${s.max_frame_size}")
+//         Err(e) => println(e.message())
+// ```
+pub fn settings_of_upgrade_value(value: Str) -> Result<H2Settings, H2DecodeError> []
+    todo("http2-nv.h2prelude.settings_of_upgrade_value")
+
+// The three headers an h2c upgrade request adds to an HTTP/1.1
+// request: `Connection`, `Upgrade` and `HTTP2-Settings`.
+//
+// Pairs of name and value, flat, alternating — `[Str]` rather than this
+// package's `H2Header`, because these are HTTP/1.1 field lines and
+// putting them in an HTTP/2 header type would invite a caller to send
+// them on an HTTP/2 connection, where `connection` and `upgrade` are
+// both forbidden names.
+//
+// ```novo
+// use std.list
+// use h2prelude
+// use h2settings
+//
+// fn main() [io]
+//     println("${list.len(h2prelude.upgrade_request_headers(h2settings.default_settings()))}")
+// ```
+pub fn upgrade_request_headers(s: H2Settings) -> [Str] []
+    todo("http2-nv.h2prelude.upgrade_request_headers")
+
+// The status line a server sends to accept an h2c upgrade.
+//
+// ```novo
+// use h2prelude
+//
+// fn main() [io]
+//     println(h2prelude.upgrade_accepted_status())
+// ```
+pub fn upgrade_accepted_status() -> Str []
+    todo("http2-nv.h2prelude.upgrade_accepted_status")
+
+// The stream identifier the upgraded request becomes: 1.
+//
+// A constant with a name because the number alone in a caller reads as
+// a magic one, and because the state it is in — half-closed (remote),
+// not idle and not open — is the thing an upgrade implementation gets
+// wrong.
+//
+// ```novo
+// use h2prelude
+//
+// fn main() [io]
+//     println("${h2prelude.upgraded_stream_id()}")
+// ```
+pub fn upgraded_stream_id() -> Int []
+    todo("http2-nv.h2prelude.upgraded_stream_id")
+
+// Is this prelude one a new deployment should be using?
+//
+// True for ALPN and prior knowledge, false for the upgrade — RFC 9113
+// § 3.1 removed it.  Published rather than written only in prose so a
+// host can log the deprecation once per connection instead of a
+// maintainer discovering it in a specification.
+//
+// ```novo
+// use h2prelude
+//
+// fn main() [io]
+//     println("${h2prelude.prelude_is_current(H2ViaUpgrade)}")
+// ```
+pub fn prelude_is_current(p: H2Prelude) -> Bool []
+    todo("http2-nv.h2prelude.prelude_is_current")

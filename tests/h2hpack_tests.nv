@@ -1,0 +1,247 @@
+// h2hpack_tests.nv — RFC 7541's own appendix C vectors, the table
+// accounting, and the never-indexed bit.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: http2-nv.<module>.<fn>`.
+//
+// THE VECTORS ARE RFC 7541 APPENDIX C.  C.1.1 is the integer that fits
+// in a prefix, C.1.2 the one that does not, C.2.1 a literal with an
+// indexed name, C.4.1 a Huffman-coded request.  They are quotations,
+// and an implementation that disagrees with one of them is wrong
+// against every other HPACK on the internet rather than against this
+// package's taste.
+
+use std.test
+use std.list
+use h2err
+use h2hpack
+
+@test
+fn test_the_static_table_is_sixty_one_entries_and_index_two_is_get() [io]
+    // Appendix A.  A single wrong entry makes one header in a hundred
+    // decode to something else on a connection that is otherwise
+    // working, and the symptom arrives as a routing bug months later.
+    test.case("sixty-one entries")
+    test.assert(h2hpack.H2_STATIC_TABLE_LEN == 61)
+    test.assert(list.len(h2hpack.static_table()) == 61)
+
+    test.case("index 2 is :method GET")
+    match h2hpack.static_at(2)
+        None    => test.assert(false)
+        Some(e) =>
+            test.assert(e.name == ":method")
+            test.assert(e.value == "GET")
+
+    test.case("index 1 is :authority with an empty value")
+    match h2hpack.static_at(1)
+        None    => test.assert(false)
+        Some(e) => test.assert(e.name == ":authority")
+
+    test.case("there is no index 0 — 0 is the marker for a literal name")
+    match h2hpack.static_at(0)
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+
+    test.case("and nothing above 61")
+    match h2hpack.static_at(62)
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+
+@test
+fn test_the_encoder_finds_a_static_index_by_pair_and_by_name() [io]
+    // Two lookups, because a `:path` of `/api/v1/users` matches no
+    // entry by value and still encodes as index 4 with a literal value,
+    // which is two bytes instead of seven.
+    test.case(":method GET is an exact pair")
+    test.assert(h2hpack.static_index_of(":method", "GET") == 2)
+
+    test.case(":path has a name-only match")
+    test.assert(h2hpack.static_index_of_name(":path") == 4)
+
+    test.case("a name nobody indexed answers 0 rather than an optional")
+    test.assert(h2hpack.static_index_of_name("x-request-id") == 0)
+
+@test
+fn test_the_integer_encoding_is_appendix_c_1() [io]
+    // C.1.1: 10 in a 5-bit prefix is one byte.  C.1.2: 1337 in a 5-bit
+    // prefix is 31, 154, 10 — the prefix filled with ones and then two
+    // continuation bytes.  An implementation that got the continuation
+    // wrong produces a header block a peer reads as something else
+    // entirely rather than as an error.
+    test.case("1337 in a five-bit prefix reads back as 1337")
+    match h2hpack.integer_of_bytes([0x1F as u8, 0x9A as u8, 0x0A as u8], 0, 5)
+        Err(_) => test.assert(false)
+        Ok(v)  =>
+            test.assert(v.value == 1337)
+            test.assert(v.next == 3)
+
+    test.case("10 in a five-bit prefix is one byte")
+    match h2hpack.integer_of_bytes([0x0A as u8], 0, 5)
+        Err(_) => test.assert(false)
+        Ok(v)  =>
+            test.assert(v.value == 10)
+            test.assert(v.next == 1)
+
+    test.case("and the round trip is a round trip")
+    test.assert(list.len(h2hpack.integer_into(1337, 5, 0, [])) == 3)
+
+    test.case("a continuation sequence that never ends is refused, not wrapped")
+    match h2hpack.integer_of_bytes([0x1F as u8, 0xFF as u8, 0xFF as u8, 0xFF as u8,
+                                    0xFF as u8, 0xFF as u8, 0xFF as u8, 0xFF as u8,
+                                    0xFF as u8, 0xFF as u8, 0x7F as u8],
+                                    0, 5)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_huffman_is_emitted_only_when_it_is_shorter() [io]
+    // § 5.2.  The code is optimised for the characters that occur in
+    // headers, so a base64 blob gets LONGER — and an encoder that always
+    // Huffman-coded would inflate exactly the headers that are already
+    // large.
+    test.case("the code table is 257 symbols, end-of-string included")
+    test.assert(list.len(h2hpack.huffman_codes()) == 257)
+    test.assert(list.len(h2hpack.huffman_lengths()) == 257)
+
+    test.case("www.example.com is shorter Huffman-coded — it is 12 bytes, not 15")
+    test.assert(h2hpack.huffman_encoded_len("www.example.com") == 12)
+    test.assert(h2hpack.huffman_shorter("www.example.com"))
+
+@test
+fn test_the_dynamic_table_evicts_by_the_thirty_two_byte_rule() [io]
+    // § 4.1: an entry costs its name plus its value plus 32.  § 4.4: an
+    // entry larger than the whole table EMPTIES the table and is not
+    // added — which is the rule a naive eviction loop turns into an
+    // infinite loop.
+    test.case("an entry costs name + value + 32")
+    test.assert(h2hpack.entry_size(H2Entry { name: "a", value: "b" }) == 34)
+
+    test.case("a table sized zero holds nothing and is not an error")
+    let t0 = h2hpack.table_insert(h2hpack.table(0),
+                                  H2Entry { name: "x-run", value: "7" })
+    test.assert(h2hpack.table_len(t0) == 0)
+
+    test.case("an entry too large for the table empties it rather than growing it")
+    let t1 = h2hpack.table_insert(h2hpack.table(40),
+                                  H2Entry { name: "x-a", value: "1" })
+    let t2 = h2hpack.table_insert(t1, H2Entry { name: "x-very-long-name",
+                                                value: "and-a-very-long-value" })
+    test.assert(h2hpack.table_len(t2) == 0)
+
+    test.case("a resize to zero is how an encoder says forget everything")
+    test.assert(h2hpack.table_resize(h2hpack.table(4096), 0).max_size == 0)
+
+@test
+fn test_the_index_space_is_one_space_and_sixty_two_is_the_newest() [io]
+    // The wire has one address space: 1..61 is static and 62 is the
+    // NEWEST dynamic entry.  A package that published two lookups would
+    // leave every caller writing the same subtraction, and getting it
+    // wrong by one is a header that decodes to its neighbour.
+    let t = h2hpack.table_insert(h2hpack.table(4096),
+                                 H2Entry { name: "x-run", value: "7" })
+
+    test.case("index 2 is still :method GET")
+    match h2hpack.table_at(t, 2)
+        None    => test.assert(false)
+        Some(e) => test.assert(e.value == "GET")
+
+    test.case("index 62 is the entry just inserted")
+    match h2hpack.table_at(t, 62)
+        None    => test.assert(false)
+        Some(e) => test.assert(e.name == "x-run")
+
+    test.case("and the lookup answers the same number")
+    test.assert(h2hpack.table_index_of(t, "x-run", "7") == 62)
+
+@test
+fn test_never_indexed_is_a_property_of_the_value_and_survives_a_relay() [io]
+    // § 7.1.3.  A compression table shared across requests is what CRIME
+    // and BREACH read secrets out of, so a credential gets a
+    // representation that says "do not table this, and do not let an
+    // intermediary table it either".  It is a field on the header
+    // because the decision belongs to whoever knows what the value is,
+    // and an encoder that took it as a call-site argument would lose it
+    // on the first relay.
+    test.case("an ordinary header is incrementally indexable")
+    match h2hpack.indexing_of(h2hpack.header("content-type", "application/grpc"))
+        H2IndexNever => test.assert(false)
+        _            => test.assert(true)
+
+    test.case("a credential is never indexed")
+    match h2hpack.indexing_of(h2hpack.header_never_indexed("authorization", "Bearer x"))
+        H2IndexNever => test.assert(true)
+        _            => test.assert(false)
+
+    test.case("and the bit is on the header itself")
+    test.assert(h2hpack.header_never_indexed("authorization", "Bearer x").never_indexed)
+
+@test
+fn test_an_uppercase_header_name_is_malformed_and_not_normalised() [io]
+    // § 8.2.1.  HTTP/1.1 field names are case-insensitive and HTTP/2
+    // names are lowercase or the message is malformed.  A package that
+    // quietly lowercased them would hide a caller's bug until it met an
+    // implementation that does not.
+    test.case("Content-Type is refused")
+    test.assert(not h2hpack.name_ok("Content-Type"))
+
+    test.case("content-type is fine")
+    test.assert(h2hpack.name_ok("content-type"))
+
+    test.case("connection is forbidden outright, whatever its case")
+    test.assert(not h2hpack.name_ok("connection"))
+
+    test.case("and so is transfer-encoding")
+    test.assert(not h2hpack.name_ok("transfer-encoding"))
+
+    test.case("a value with a newline in it is a response split, refused here")
+    test.assert(not h2hpack.value_ok("ok\r\nx-evil: 1"))
+
+@test
+fn test_pseudo_headers_come_first_and_the_fault_names_the_header() [io]
+    // § 8.3.  A peer receiving them out of order treats the message as
+    // malformed, and a fault that answered an index would mean nothing
+    // to whoever sent it.
+    test.case("a list in order has no fault")
+    match h2hpack.pseudo_order_fault([h2hpack.header(":method", "GET"),
+                                      h2hpack.header("accept", "*/*")])
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+
+    test.case("a pseudo-header after a regular one is named")
+    match h2hpack.pseudo_order_fault([h2hpack.header("accept", "*/*"),
+                                      h2hpack.header(":method", "GET")])
+        None    => test.assert(false)
+        Some(n) => test.assert(n == ":method")
+
+    test.case("and a name beginning with a colon is what makes one pseudo")
+    test.assert(h2hpack.is_pseudo(":authority"))
+    test.assert(not h2hpack.is_pseudo("authority"))
+
+@test
+fn test_the_header_list_size_counts_thirty_two_per_entry() [io]
+    // § 6.5.2 measures the LIST with HPACK's per-entry overhead as
+    // well, which is why the limit is not simply "the bytes": a peer
+    // that measured only the bytes would accept ten thousand empty
+    // headers.
+    test.case("one header of a one-byte name and a one-byte value counts 34")
+    test.assert(h2hpack.list_size([h2hpack.header("a", "b")]) == 34)
+
+    test.case("and an empty list counts nothing")
+    test.assert(h2hpack.list_size([]) == 0)
+
+@test
+fn test_a_block_is_decoded_whole_or_not_at_all() [io]
+    // HPACK is stateful across the connection: a decoder given half a
+    // block has a dynamic table that matches nobody's, and every later
+    // block decodes to something the sender never wrote.  That is why
+    // a COMPRESSION_ERROR is always a connection error.
+    test.case("the indexed field 0x82 is :method GET")
+    match h2hpack.decode(h2hpack.table(4096), [0x82 as u8], 8192)
+        Err(_) => test.assert(false)
+        Ok(d)  =>
+            test.assert(list.len(d.headers) == 1)
+
+    test.case("an index nobody has is a fault, and it is the connection's")
+    match h2hpack.decode(h2hpack.table(4096), [0xFF as u8, 0x00 as u8], 8192)
+        Ok(_)  => test.assert(false)
+        Err(e) => test.assert(h2err.is_connection_fault(e))

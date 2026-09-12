@@ -1,0 +1,495 @@
+// h2frame.nv — the nine-byte header and the ten frame types, to and
+// from bytes a caller already holds.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE FRAME LAYER IS THE PART THAT BUILDS FOR A DEVICE.  Everything in
+// this module is fixed-width integer arithmetic over a caller's `[u8]`:
+// a nine-byte header of a 24-bit length, an 8-bit type, an 8-bit flag
+// set and a 31-bit stream identifier, then a payload whose shape the
+// type decides.  No allocator is needed to READ one, which is why the
+// package's `@tier(embedded)` claim lives here, in `h2hpack`'s lookups
+// and prefix-integer reader, and in the whole of `h2flow` — and nowhere
+// else.
+//
+// A FRAME IS A VALUE AND A HEADER IS A SEPARATE VALUE, because the host
+// reads them at different times.  A socket hands over nine bytes before
+// it hands over the payload, and a reader that could not ask "how many
+// bytes is this frame" without already holding them would have to guess
+// how much to read.  `header_of_bytes` answers from nine bytes;
+// `frame_of_bytes` wants the whole thing.
+//
+// THE PAYLOAD OF A HEADERS FRAME IS NOT PARSED HERE.  `H2FrameHeaders`
+// carries the HPACK block as bytes and nothing more, because a header
+// block may be split across CONTINUATION frames and HPACK is stateful
+// across the whole connection: decoding half a block against the
+// dynamic table and then discovering the rest is elsewhere would leave
+// the table in a state neither peer can recover.  `h2conn` joins the
+// fragments and `h2hpack` decodes the join.
+//
+// AN UNKNOWN FRAME TYPE IS IGNORED, § 4.1.  That is the protocol's
+// extension point — ALTSVC, ORIGIN and PRIORITY_UPDATE all arrived this
+// way — and an implementation that refused one is an implementation
+// that breaks on the next extension.  `H2FrameIgnored` is what the
+// decoder answers, so the caller can see that something was skipped and
+// how much.
+//
+// PRIORITY IS PARSED AND NEVER ACTED ON.  RFC 9113 § 5.3.1 deprecates
+// the RFC 7540 scheme: the stream dependency tree cost implementers
+// years and no deployment used it, and § 5.3 now says an endpoint MAY
+// ignore it entirely.  This package parses the five bytes so a relay
+// can pass them on and a capture can be read, and offers no scheduler.
+// Naming that here is the honest form of the omission.
+//
+// NOTHING HERE PERFORMS ANYTHING.  Every row in this module is `[]`.
+
+// The bytes in a frame header: nine, always, RFC 9113 § 4.1.
+pub const H2_FRAME_HEADER_LEN = 9
+
+// The smallest SETTINGS_MAX_FRAME_SIZE a peer may announce, and the
+// payload size every endpoint must accept: 16384.
+pub const H2_MIN_MAX_FRAME = 16384
+
+// The largest SETTINGS_MAX_FRAME_SIZE a peer may announce, which is
+// what a 24-bit length field can hold: 16777215.
+pub const H2_MAX_MAX_FRAME = 16777215
+
+// The highest stream identifier, 2^31 - 1.  The top bit of the
+// identifier field is reserved and MUST be ignored on receipt, which is
+// why a decoder masks rather than refusing.
+pub const H2_MAX_STREAM_ID = 2147483647
+
+// Which frame this is, RFC 9113 § 6.
+pub enum H2FrameKind
+    // 0x00 DATA — a message body.
+    H2KindData
+    // 0x01 HEADERS — the start of a message, as an HPACK block.
+    H2KindHeaders
+    // 0x02 PRIORITY — deprecated by § 5.3.1, parsed, never acted on.
+    H2KindPriority
+    // 0x03 RST_STREAM — one stream, ended.
+    H2KindRstStream
+    // 0x04 SETTINGS — connection-scoped, and an ACK is a separate frame
+    // with a flag and an empty payload.
+    H2KindSettings
+    // 0x05 PUSH_PROMISE — a server announcing a stream it will open.
+    H2KindPushPromise
+    // 0x06 PING — connection-scoped, eight opaque bytes echoed back.
+    H2KindPing
+    // 0x07 GOAWAY — the connection, ending, with the last stream the
+    // sender processed.
+    H2KindGoAway
+    // 0x08 WINDOW_UPDATE — flow-control credit, on a stream or on the
+    // connection.
+    H2KindWindowUpdate
+    // 0x09 CONTINUATION — more of the header block that the HEADERS or
+    // PUSH_PROMISE before it began.
+    H2KindContinuation
+    // Anything else.  § 4.1 requires it to be ignored and discarded.
+    H2KindUnknown(kind: Int)
+
+// One frame's header: what type, which stream, how long, which flags.
+//
+// `flags` is the raw byte rather than a set of `Bool`s, because the
+// meaning of a bit depends on the type — 0x08 is PADDED on DATA and
+// ACK is 0x01 on SETTINGS and on PING — and a struct of named booleans
+// would have to carry every name for every type.  The predicates below
+// are how a caller reads it.
+pub struct H2FrameHeader
+    kind: H2FrameKind
+    flags: Int
+    // 0 for a connection-scoped frame.  The reserved top bit is already
+    // masked off.
+    stream: Int
+    // The payload length, not counting these nine bytes.
+    length: Int
+
+// A stream's priority as RFC 7540 defined it, kept for relay and for
+// reading a capture.
+//
+// `weight` is the wire value plus one — the field carries 0..255 and
+// means 1..256, which is the single most common off-by-one in a
+// priority implementation and the reason this struct holds the real
+// number rather than the byte.
+pub struct H2Priority
+    depends_on: Int
+    weight: Int
+    exclusive: Bool
+
+// One frame, decoded to the shape its type means.
+//
+// DATA and the header-block frames carry `[u8]` slices of the caller's
+// own buffer rather than anything this package allocated, which is what
+// lets a device read a frame without an allocator and what lets a proxy
+// forward one without copying it.
+pub enum H2Frame
+    // A message body fragment.  Padding is already removed.
+    H2FrameData(stream: Int, data: [u8], end_stream: Bool)
+    // The beginning of a header block.  `end_headers` false means at
+    // least one CONTINUATION follows and the block is not yet
+    // decodable.
+    H2FrameHeaders(stream: Int, block: [u8], end_stream: Bool, end_headers: Bool,
+                   priority: ?H2Priority)
+    // A PRIORITY frame on its own.  Deprecated; parsed so a relay can
+    // forward it.
+    H2FramePriorityOnly(stream: Int, priority: H2Priority)
+    // One stream, ended by its peer.
+    H2FrameReset(stream: Int, code: H2ErrorCode)
+    // A settings announcement, or the acknowledgement of one.  An ACK
+    // carries no entries, and one that does is a connection error.
+    H2FrameSettings(entries: [H2Setting], ack: Bool)
+    // A server announcing the stream it is about to open, with the
+    // request headers it is answering in advance.
+    H2FramePushPromise(stream: Int, promised: Int, block: [u8], end_headers: Bool)
+    // Eight opaque bytes.  An ACK echoes them unchanged, which is what
+    // makes a round-trip measurement possible without a sequence number.
+    H2FramePing(opaque: [u8], ack: Bool)
+    // The connection, ending.  `last_stream` is the highest identifier
+    // the sender PROCESSED — every stream above it was never looked at,
+    // which is what makes those safe to retry.
+    H2FrameGoAway(last_stream: Int, code: H2ErrorCode, debug: [u8])
+    // Flow-control credit.  `stream` 0 credits the connection.
+    H2FrameWindowUpdate(stream: Int, increment: Int)
+    // More of the block the frame before it began.
+    H2FrameContinuation(stream: Int, block: [u8], end_headers: Bool)
+    // A type this package does not know, skipped.  § 4.1 requires it to
+    // be ignored; the caller is told so it can count them rather than
+    // wonder where the bytes went.
+    H2FrameIgnored(kind: Int, stream: Int, length: Int)
+
+// The number a frame type has on the wire.
+//
+// ```novo
+// use h2frame
+//
+// fn main() [io]
+//     println("${h2frame.frame_kind_num(H2KindWindowUpdate)}")
+// ```
+pub @tier(embedded)
+fn frame_kind_num(k: H2FrameKind) -> Int []
+    todo("http2-nv.h2frame.frame_kind_num")
+
+// The frame type a number names, or `H2KindUnknown` with the number.
+//
+// ```novo
+// use h2frame
+//
+// fn main() [io]
+//     println(h2frame.frame_kind_name(h2frame.frame_kind_of_num(0x01)))
+// ```
+pub @tier(embedded)
+fn frame_kind_of_num(n: Int) -> H2FrameKind []
+    todo("http2-nv.h2frame.frame_kind_of_num")
+
+// The specification's own spelling — `"WINDOW_UPDATE"`, `"HEADERS"`.
+//
+// ```novo
+// use h2frame
+//
+// fn main() [io]
+//     println(h2frame.frame_kind_name(H2KindGoAway))
+// ```
+pub fn frame_kind_name(k: H2FrameKind) -> Str []
+    todo("http2-nv.h2frame.frame_kind_name")
+
+// Must this frame type name a stream?
+//
+// DATA, HEADERS, PRIORITY, RST_STREAM, PUSH_PROMISE and CONTINUATION
+// must; SETTINGS, PING and GOAWAY must not; WINDOW_UPDATE may do
+// either, because the connection window is credited on stream 0.
+//
+// Published rather than folded into the decoder because a host writing
+// its own frames needs the same rule, and § 4.1 makes getting it wrong
+// a connection error in both directions.
+//
+// ```novo
+// use h2frame
+//
+// fn main() [io]
+//     println("${h2frame.needs_stream(H2KindData)}")
+// ```
+pub @tier(embedded)
+fn needs_stream(k: H2FrameKind) -> Bool []
+    todo("http2-nv.h2frame.needs_stream")
+
+// Must this frame type be connection-scoped — stream 0?
+//
+// ```novo
+// use h2frame
+//
+// fn main() [io]
+//     println("${h2frame.is_connection_scoped(H2KindPing)}")
+// ```
+pub @tier(embedded)
+fn is_connection_scoped(k: H2FrameKind) -> Bool []
+    todo("http2-nv.h2frame.is_connection_scoped")
+
+// Is END_STREAM set — 0x01 on DATA and on HEADERS?
+//
+// ```novo
+// use h2frame
+//
+// fn main() [io]
+//     println("${h2frame.flag_end_stream(H2KindData, 0x01)}")
+// ```
+pub @tier(embedded)
+fn flag_end_stream(k: H2FrameKind, flags: Int) -> Bool []
+    todo("http2-nv.h2frame.flag_end_stream")
+
+// Is END_HEADERS set — 0x04 on HEADERS, PUSH_PROMISE and CONTINUATION?
+//
+// ```novo
+// use h2frame
+//
+// fn main() [io]
+//     println("${h2frame.flag_end_headers(H2KindHeaders, 0x04)}")
+// ```
+pub @tier(embedded)
+fn flag_end_headers(k: H2FrameKind, flags: Int) -> Bool []
+    todo("http2-nv.h2frame.flag_end_headers")
+
+// Is PADDED set — 0x08 on DATA, HEADERS and PUSH_PROMISE?
+//
+// ```novo
+// use h2frame
+//
+// fn main() [io]
+//     println("${h2frame.flag_padded(H2KindData, 0x08)}")
+// ```
+pub @tier(embedded)
+fn flag_padded(k: H2FrameKind, flags: Int) -> Bool []
+    todo("http2-nv.h2frame.flag_padded")
+
+// Is PRIORITY set — 0x20, and only on HEADERS?
+//
+// ```novo
+// use h2frame
+//
+// fn main() [io]
+//     println("${h2frame.flag_priority(H2KindHeaders, 0x20)}")
+// ```
+pub @tier(embedded)
+fn flag_priority(k: H2FrameKind, flags: Int) -> Bool []
+    todo("http2-nv.h2frame.flag_priority")
+
+// Is ACK set — 0x01, and only on SETTINGS and PING?
+//
+// ACK and END_STREAM are the same bit on different frame types, which
+// is why every flag predicate here takes the kind: a function that read
+// 0x01 without knowing the type would report an acknowledged DATA
+// frame.
+//
+// ```novo
+// use h2frame
+//
+// fn main() [io]
+//     println("${h2frame.flag_ack(H2KindSettings, 0x01)}")
+// ```
+pub @tier(embedded)
+fn flag_ack(k: H2FrameKind, flags: Int) -> Bool []
+    todo("http2-nv.h2frame.flag_ack")
+
+// The nine-byte header at `at`, read from a caller's buffer.
+//
+// Answers a fault when fewer than nine bytes are available from `at`,
+// so a host that reads a socket in arbitrary chunks can ask before it
+// has a whole frame.  The reserved top bit of the stream identifier is
+// masked off rather than refused — § 4.1 requires it to be ignored.
+//
+// ```novo
+// use h2frame
+//
+// fn main() [io]
+//     match h2frame.header_of_bytes([0 as u8, 0 as u8, 0 as u8, 4 as u8,
+//                                    0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8], 0)
+//         Ok(h)  => println("${h.length}")
+//         Err(e) => println(e.message())
+// ```
+pub fn header_of_bytes(src: [u8], at: Int) -> Result<H2FrameHeader, H2DecodeError> []
+    todo("http2-nv.h2frame.header_of_bytes")
+
+// The nine bytes of a header, appended to a buffer the caller owns.
+//
+// Appended rather than returned as its own array, because a writer
+// builds a header and its payload into one buffer and issues one write;
+// a package that answered a fresh array per frame would make a hundred
+// small writes out of a hundred frames.
+//
+// ```novo
+// use std.list
+// use h2frame
+//
+// fn main() [io]
+//     let h = H2FrameHeader { kind: H2KindPing, flags: 0, stream: 0, length: 8 }
+//     println("${list.len(h2frame.header_into(h, []))}")
+// ```
+pub fn header_into(h: H2FrameHeader, out: [u8]) -> [u8] []
+    todo("http2-nv.h2frame.header_into")
+
+// A whole frame at `at`, header and payload, against a maximum the peer
+// announced.
+//
+// `max_frame` is the LOCAL SETTINGS_MAX_FRAME_SIZE — what this endpoint
+// said it would accept — and not the remote one.  A decoder checking
+// the peer's own limit would accept frames it had promised to refuse,
+// which is a memory bound given away.
+//
+// ```novo
+// use h2frame
+//
+// fn main() [io]
+//     match h2frame.frame_of_bytes([], 0, 16384)
+//         Ok(f)  => println(h2frame.frame_kind_name(h2frame.frame_kind(f)))
+//         Err(e) => println(e.message())
+// ```
+pub fn frame_of_bytes(src: [u8], at: Int, max_frame: Int) -> Result<H2Frame, H2DecodeError> []
+    todo("http2-nv.h2frame.frame_of_bytes")
+
+// A whole frame, header and payload, appended to a caller's buffer.
+//
+// `max_frame` here IS the remote setting: writing is bounded by what
+// the peer said it would accept.  The two directions use different
+// copies of the same parameter, which is the reason `h2settings` says
+// so loudly that there are always two.
+//
+// ```novo
+// use std.list
+// use h2frame
+//
+// fn main() [io]
+//     match h2frame.frame_into(H2FramePing(opaque: [], ack: false), 16384, [])
+//         Ok(out) => println("${list.len(out)}")
+//         Err(e)  => println(e.message())
+// ```
+pub fn frame_into(f: H2Frame, max_frame: Int, out: [u8]) -> Result<[u8], H2EncodeError> []
+    todo("http2-nv.h2frame.frame_into")
+
+// How many payload bytes this frame will write.
+//
+// Asked before `frame_into` by a caller sizing a buffer, and by
+// `h2flow` to decide whether the frame fits the window at all.
+//
+// ```novo
+// use h2frame
+//
+// fn main() [io]
+//     println("${h2frame.frame_length(H2FrameWindowUpdate(stream: 1, increment: 4096))}")
+// ```
+pub fn frame_length(f: H2Frame) -> Int []
+    todo("http2-nv.h2frame.frame_length")
+
+// Which stream this frame is on, 0 for a connection-scoped one.
+//
+// ```novo
+// use h2frame
+//
+// fn main() [io]
+//     println("${h2frame.frame_stream(H2FrameReset(stream: 3, code: H2ErrCancel))}")
+// ```
+pub fn frame_stream(f: H2Frame) -> Int []
+    todo("http2-nv.h2frame.frame_stream")
+
+// Which type this frame is.
+//
+// ```novo
+// use h2frame
+//
+// fn main() [io]
+//     println(h2frame.frame_kind_name(
+//         h2frame.frame_kind(H2FramePing(opaque: [], ack: true))))
+// ```
+pub fn frame_kind(f: H2Frame) -> H2FrameKind []
+    todo("http2-nv.h2frame.frame_kind")
+
+// Does this frame count against the flow-control window?
+//
+// DATA and nothing else, § 5.2.1 — and that is the sentence a
+// first implementation gets wrong in the safe direction and a second
+// one gets wrong in the expensive direction.  HEADERS, SETTINGS and
+// PING are not flow controlled, so a connection whose window is closed
+// still carries them; counting them stalls a connection nobody can
+// unstall, because WINDOW_UPDATE is not flow controlled either.
+//
+// ```novo
+// use h2frame
+//
+// fn main() [io]
+//     println("${h2frame.is_flow_controlled(H2KindHeaders)}")
+// ```
+pub @tier(embedded)
+fn is_flow_controlled(k: H2FrameKind) -> Bool []
+    todo("http2-nv.h2frame.is_flow_controlled")
+
+// A payload with its padding removed, or the fault the padding is.
+//
+// § 6.1 counts the padding-length byte itself in the frame length, so a
+// padding length equal to or greater than the remaining payload is a
+// connection error rather than an empty body — the two differ by one
+// and the wrong one lets a peer make a decoder read past its buffer.
+//
+// ```novo
+// use std.list
+// use h2frame
+//
+// fn main() [io]
+//     match h2frame.unpad([0 as u8, 65 as u8], true)
+//         Ok(body) => println("${list.len(body)}")
+//         Err(e)   => println(e.message())
+// ```
+pub fn unpad(payload: [u8], padded: Bool) -> Result<[u8], H2DecodeError> []
+    todo("http2-nv.h2frame.unpad")
+
+// The five bytes of a priority field, read from a payload.
+//
+// ```novo
+// use h2frame
+//
+// fn main() [io]
+//     match h2frame.priority_of_bytes([0 as u8, 0 as u8, 0 as u8, 0 as u8, 15 as u8], 0)
+//         Ok(p)  => println("${p.weight}")
+//         Err(e) => println(e.message())
+// ```
+pub fn priority_of_bytes(src: [u8], at: Int) -> Result<H2Priority, H2DecodeError> []
+    todo("http2-nv.h2frame.priority_of_bytes")
+
+// The priority RFC 7540 gives a stream nobody prioritised: depends on
+// stream 0, weight 16, not exclusive.
+//
+// ```novo
+// use h2frame
+//
+// fn main() [io]
+//     println("${h2frame.default_priority().weight}")
+// ```
+pub fn default_priority() -> H2Priority []
+    todo("http2-nv.h2frame.default_priority")
+
+// Does this priority make a stream depend on itself?
+//
+// § 5.3.1 makes that a stream error, and it is the one priority rule an
+// endpoint that ignores priority still has to enforce: a relay that
+// forwarded it would hand a dependency cycle to something downstream
+// that does not ignore it.
+//
+// ```novo
+// use h2frame
+//
+// fn main() [io]
+//     println("${h2frame.priority_is_self_dependent(
+//         3, H2Priority { depends_on: 3, weight: 16, exclusive: false })}")
+// ```
+pub fn priority_is_self_dependent(stream: Int, p: H2Priority) -> Bool []
+    todo("http2-nv.h2frame.priority_is_self_dependent")
+
+// Is this a legal stream identifier at all — above zero, at or below
+// 2^31-1?
+//
+// ```novo
+// use h2frame
+//
+// fn main() [io]
+//     println("${h2frame.stream_id_ok(1)}")
+// ```
+pub @tier(embedded)
+fn stream_id_ok(stream: Int) -> Bool []
+    todo("http2-nv.h2frame.stream_id_ok")

@@ -1,0 +1,76 @@
+[package]
+name        = "http2-nv"
+license     = "Apache-2.0"
+version     = "0.0.1"
+description = "HTTP/2 as a connection value a host pumps: the ten frame types to and from bytes, HPACK with its static table, its Huffman code and a dynamic table the caller sizes, the seven-state stream machine, connection and stream flow control as arithmetic, settings, and the ALPN, prior-knowledge and h2c preludes.  Sans-IO: every call answers the events the host learned and the actions it must perform, and nothing here touches a socket.  Interface only — every body is a todo()."
+
+# `license` sits immediately after the name, before any value that could
+# contain a square bracket.  The publish reads it with a pattern that
+# stops at the first `[`, so a description naming an effect row hides it
+# and the release records no licence at all — silently.
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `core`, and EVERY row in the package is `[]` — there is not one
+# effect-polymorphic function either.  That is unusual enough to say
+# why: HTTP/2 is a protocol whose whole difficulty is state, and the
+# state is a value.  A connection takes the bytes a host read, answers
+# the events those bytes completed and the actions the host now owes,
+# and the host is the only party that opens anything, writes anything or
+# reads a clock.  There is no stream to take through a trait, because
+# the caller's stream never enters this package: it enters as `[u8]`.
+#
+# The device claim is real and it is narrow.  `tests/embedded_probe.nv`
+# builds the frame header codec, HPACK's integer and Huffman
+# encodings, the static-table lookups and the whole of flow control for
+# `--target=nrf52-qemu`; those carry `@tier(embedded)` and the probe is
+# the proof.  The connection value itself does NOT carry the claim and
+# the README says why: it holds a list of streams and a dynamic table,
+# both of which allocate.
+layer       = "core"
+
+category    = "networking"
+
+tags        = ["http2", "http", "hpack", "rfc9113", "rfc7541", "sans-io", "grpc", "flow-control"]
+repository  = "https://github.com/novolang/http2-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "The frames, HPACK, the streams and the windows, as a value"
+
+[dependencies]
+# The `HTTP2-Settings` header of an h2c upgrade is base64url WITHOUT
+# padding, RFC 7540 § 3.2.1 — and both halves of that sentence are
+# reasons a caller must not be handed raw bytes and left to encode them:
+# standard base64's `+` and `/` are not safe in a header field, and the
+# `=` padding is refused by conforming servers.  base64-nv is `core`, so
+# it costs a consumer no effects, and this is the one place in the
+# package that needs it.
+base64-nv = "^0.0.1"
+
+# NOT http-codec-nv, and the absence is deliberate rather than an
+# oversight.  That package is HTTP/1.1 and its `H1Header` is a field
+# line: a name whose case is insignificant, a value, and no indexing
+# decision.  An HTTP/2 header name with a capital in it is a malformed
+# message (RFC 9113 § 8.2.1), and every header carries HPACK's
+# never-indexed bit, which is a security property of the VALUE that must
+# survive a relay.  Sharing the type would mean either an HTTP/1.1 type
+# growing an HPACK field or this package losing the one it needs, so
+# `H2Header` is its own — and the conversion between them is three
+# lines in whichever host bridges the two protocols.
+#
+# NOT unicode-nv: HPACK's Huffman code is a table over bytes and header
+# values are ASCII by every convention in use.
+#
+# NOT grpc-codec-nv or grpc-nv, in the other direction.  This package is
+# not a gRPC package; a plain HTTP/2 server needs all of it.  The README
+# says what grpc-nv changes to sit on top.

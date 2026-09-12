@@ -1,0 +1,138 @@
+// h2flow_tests.nv — the two windows, the negative one, and the credit
+// a receiver owes.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: http2-nv.<module>.<fn>`.
+//
+// FLOW CONTROL IS PURE ARITHMETIC AND STILL GETS EVERY IMPLEMENTATION
+// ONCE.  Each case below is one of the ways, and each of them passes a
+// naive test suite because a naive suite never changes a setting, never
+// stalls a stream and never has more than one stream open.
+
+use std.test
+use h2err
+use h2flow
+use h2settings
+
+@test
+fn test_a_send_is_the_minimum_of_three_ceilings() [io]
+    // § 5.2.1: a DATA frame is counted against the CONNECTION window
+    // and the STREAM window, and it also may not exceed the peer's
+    // maximum frame size.  A sender that consulted only the stream's
+    // window starves every other stream on the connection; one that
+    // consulted only the connection's exceeds a window the peer is
+    // entitled to reset the stream over.
+    let conn = h2flow.window(65535)
+    let small = h2flow.window(1000)
+
+    test.case("the stream window is the binding one here")
+    test.assert(h2flow.sendable(conn, small, 50000, 16384) == 1000)
+
+    test.case("and the frame size is the binding one here")
+    test.assert(h2flow.sendable(conn, h2flow.window(65535), 50000, 16384) == 16384)
+
+    test.case("and the connection window is the binding one here")
+    test.assert(h2flow.sendable(h2flow.window(500), h2flow.window(65535),
+                                50000, 16384) == 500)
+
+    test.case("a stalled stream answers 0, which is ordinary and not a fault")
+    test.assert(h2flow.sendable(conn, h2flow.window(0), 50000, 16384) == 0)
+
+@test
+fn test_the_default_window_is_sixty_four_kilobytes_and_that_is_why_it_stalls() [io]
+    // § 6.9.2.  A connection that never sends a WINDOW_UPDATE transfers
+    // 64 KiB and stops.  A client that felt "slow" and was fixed by
+    // "increasing a buffer" was almost always this.
+    test.case("65535, which is not 65536")
+    test.assert(h2flow.H2_DEFAULT_WINDOW == 65535)
+    test.assert(h2flow.window(h2flow.H2_DEFAULT_WINDOW).available == 65535)
+
+    test.case("and the ceiling is 2^31 - 1")
+    test.assert(h2flow.H2_MAX_WINDOW == 2147483647)
+
+@test
+fn test_a_window_may_be_negative_and_must_not_be_clamped() [io]
+    // § 6.9.2's retroactive change.  A stream with 30000 bytes of credit
+    // against a 65535-byte initial window has 30000 - 35535 = -5535
+    // after the peer announces 30000, and the sender sends NOTHING
+    // until 5536 bytes of credit arrive.  Clamping to zero sends 5535
+    // bytes the peer counts as a violation.
+    test.case("the delta is the subtraction, and it is negative here")
+    test.assert(h2settings.window_delta(65535, 30000) == 0 - 35535)
+
+    test.case("applying it leaves the window below zero")
+    match h2flow.retune(h2flow.window(30000), h2settings.window_delta(65535, 30000))
+        Err(_) => test.assert(false)
+        Ok(w)  =>
+            test.assert(w.available == 0 - 5535)
+            test.assert(h2flow.is_stalled(w))
+
+    test.case("and nothing may be sent against it")
+    match h2flow.retune(h2flow.window(30000), 0 - 35535)
+        Err(_) => test.assert(false)
+        Ok(w)  => test.assert(h2flow.sendable(h2flow.window(65535), w, 100, 16384) == 0)
+
+    test.case("a change in the other direction opens every open stream")
+    test.assert(h2settings.window_delta(65535, 131070) == 65535)
+
+@test
+fn test_a_window_update_of_zero_is_a_protocol_error_and_an_overflow_is_not() [io]
+    // Two adjacent mistakes with two different error codes, § 6.9 and
+    // § 6.9.1.  A package that answered one code for both would have a
+    // host sending the wrong one, and a conforming peer logs it.
+    test.case("zero is refused rather than treated as a no-op")
+    match h2flow.credit(h2flow.window(0), 0)
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(h2err.error_code_num(h2flow.fault_code(f)) == 0x01)
+
+    test.case("past 2^31-1 is a flow-control error")
+    match h2flow.credit(h2flow.window(h2flow.H2_MAX_WINDOW), 1)
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(h2err.error_code_num(h2flow.fault_code(f)) == 0x03)
+
+    test.case("and an ordinary credit simply adds")
+    match h2flow.credit(h2flow.window(0), 65535)
+        Err(_) => test.assert(false)
+        Ok(w)  => test.assert(w.available == 65535)
+
+@test
+fn test_credit_is_owed_on_delivery_and_not_on_arrival() [io]
+    // The separation IS the back pressure.  A receiver that credited on
+    // arrival has an unbounded buffer wearing a flow-control mechanism,
+    // and the symptom is a memory graph rather than an error.
+    let arrived = h2flow.receive(h2flow.window(65535), 40000)
+
+    test.case("arrival shrinks the window")
+    match arrived
+        Err(_) => test.assert(false)
+        Ok(w)  => test.assert(w.available == 25535)
+
+    test.case("but nothing is owed until the application has read it")
+    match arrived
+        Err(_) => test.assert(false)
+        Ok(w)  => test.assert(h2flow.update_due(w, 65535, 2) == 0)
+
+    test.case("delivery is what makes the credit due — half the window here")
+    match arrived
+        Err(_) => test.assert(false)
+        Ok(w)  => test.assert(h2flow.update_due(h2flow.deliver(w, 40000), 65535, 2) == 40000)
+
+    test.case("and granting it clears the counter, or the next frame announces it again")
+    match arrived
+        Err(_) => test.assert(false)
+        Ok(w)  => test.assert(h2flow.granted(h2flow.deliver(w, 40000), 40000).consumed == 0)
+
+@test
+fn test_a_peer_that_overran_the_window_is_reported_and_the_bytes_still_count() [io]
+    // A receiver that discarded the excess would disagree with the
+    // sender about the window for the rest of the connection, which is
+    // worse than the violation it was answering.
+    test.case("more than the window is a fault")
+    match h2flow.receive(h2flow.window(100), 200)
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(h2err.error_code_num(h2flow.fault_code(f)) == 0x03)
+
+    test.case("and sending more than the window is the caller's own bug")
+    match h2flow.spend(h2flow.window(100), 200)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)

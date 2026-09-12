@@ -1,0 +1,242 @@
+// embedded_probe.nv — the half of this package that runs on a
+// microcontroller, built as firmware and run under QEMU.
+//
+// This is not a test; the audit's `core-embedded` row cross-compiles it
+// for `--target=nrf52-qemu`.  What it proves is the thing a host test
+// cannot: that the frame-layer arithmetic, HPACK's prefix-integer
+// encoding and the whole of flow control LINK on a Cortex-M — no
+// allocator, and a 31-bit stream identifier and a 24-bit length lowered
+// onto a 32-bit core through whatever EABI helpers that takes.
+//
+// THE CONSUMER IS REAL, which is the condition for making this claim at
+// all.  A sensor that reports over HTTP/2 to a gateway holds one
+// connection and one or two streams: it reads a nine-byte header,
+// decides whether the frame is for it, subtracts a DATA frame's length
+// from a window, and decides whether it may send.  Every one of those is
+// in this file, and none of them needs a heap.
+//
+// WHAT IS NOT HERE, AND WHY
+//
+// The connection value.  `H2Conn` holds a list of streams, a pending
+// buffer and two HPACK dynamic tables, so it allocates by construction
+// — and `h2conn` carries no `@tier(embedded)` for exactly that reason.
+// A device drives the frame layer directly and keeps its one stream's
+// window in two integers, which is what the loop below is.
+//
+// The HPACK static table itself, and the Huffman code tables.  They are
+// 61 and 257 entries of package data, and a function that ANSWERS one
+// builds a list; what a device needs is the lookup, and
+// `static_index_of` answers an `Int` from a name it already holds.  The
+// tables stay `@tier(rt)` and the lookups carry the claim.
+//
+// And everything that parses a header block.  Decoding HPACK means a
+// dynamic table, and a dynamic table means eviction, which means
+// storage the caller did not size.  A device that must read a response
+// header uses a `h2hpack.table(0)` — static entries only — on the host
+// side of its gateway, and this probe does not claim otherwise.
+
+use std.str
+use h2err
+use h2flow
+use h2frame
+use h2hpack
+
+// Every answer this probe checks, folded into one number so a single
+// comparison decides the run.  A firmware image has one line of output;
+// making it depend on all of them is what stops a passing run from
+// meaning "the first assertion held".
+@tier(rt)
+fn score() -> Int
+    var n = 0
+
+    // ── the frame header's own constants ──────────────────────────────
+    if h2frame.H2_FRAME_HEADER_LEN == 9
+        n = n + 1
+    if h2frame.H2_MIN_MAX_FRAME == 16384
+        n = n + 1
+    if h2frame.H2_MAX_STREAM_ID == 2147483647
+        n = n + 1
+
+    // ── the type numbers, both ways ───────────────────────────────────
+    if h2frame.frame_kind_num(H2KindData) == 0x00
+        n = n + 1
+    if h2frame.frame_kind_num(H2KindHeaders) == 0x01
+        n = n + 1
+    if h2frame.frame_kind_num(H2KindWindowUpdate) == 0x08
+        n = n + 1
+    if h2frame.frame_kind_num(h2frame.frame_kind_of_num(0x07)) == 0x07
+        n = n + 1
+
+    // An unknown type keeps its number, because § 4.1 requires it to be
+    // ignored rather than refused and a relay forwards what it got.
+    if h2frame.frame_kind_num(h2frame.frame_kind_of_num(0x40)) == 0x40
+        n = n + 1
+
+    // ── the flag bits, which mean two things on two types ─────────────
+    if h2frame.flag_end_stream(H2KindData, 0x01)
+        n = n + 1
+    if h2frame.flag_ack(H2KindSettings, 0x01)
+        n = n + 1
+    if not h2frame.flag_end_stream(H2KindSettings, 0x01)
+        n = n + 1
+    if h2frame.flag_end_headers(H2KindContinuation, 0x04)
+        n = n + 1
+    if h2frame.flag_padded(H2KindData, 0x08)
+        n = n + 1
+
+    // ── which frames a device may see on which stream ─────────────────
+    if h2frame.needs_stream(H2KindData)
+        n = n + 1
+    if h2frame.is_connection_scoped(H2KindPing)
+        n = n + 1
+    if h2frame.is_flow_controlled(H2KindData)
+        n = n + 1
+    if not h2frame.is_flow_controlled(H2KindWindowUpdate)
+        n = n + 1
+    if h2frame.stream_id_ok(1)
+        n = n + 1
+    if not h2frame.stream_id_ok(0)
+        n = n + 1
+
+    // ── the error codes a device sends and reads ──────────────────────
+    if h2err.error_code_num(H2ErrNoError) == 0x00
+        n = n + 1
+    if h2err.error_code_num(H2ErrRefusedStream) == 0x07
+        n = n + 1
+    if h2err.error_code_num(H2ErrCancel) == 0x08
+        n = n + 1
+    if h2err.error_code_num(h2err.error_code_of_num(0x03)) == 0x03
+        n = n + 1
+
+    // ── the HPACK lookups a device does hold ──────────────────────────
+    if h2hpack.H2_STATIC_TABLE_LEN == 61
+        n = n + 1
+    if h2hpack.H2_ENTRY_OVERHEAD == 32
+        n = n + 1
+    if h2hpack.static_index_of(":method", "GET") == 2
+        n = n + 1
+    if h2hpack.static_index_of_name(":path") == 4
+        n = n + 1
+    if h2hpack.static_index_of_name("x-sensor-id") == 0
+        n = n + 1
+    if h2hpack.is_pseudo(":authority")
+        n = n + 1
+    if not h2hpack.is_pseudo("authority")
+        n = n + 1
+
+    // ── flow control, which is the loop the firmware actually runs ────
+    let conn = h2flow.window(h2flow.H2_DEFAULT_WINDOW)
+    let one = h2flow.window(8192)
+
+    if h2flow.H2_DEFAULT_WINDOW == 65535
+        n = n + 1
+    if conn.available == 65535
+        n = n + 1
+
+    // The minimum of three ceilings: the connection, the stream, the
+    // frame size.  A sender that consulted one of them starves the
+    // others or exceeds a window the peer resets over.
+    if h2flow.sendable(conn, one, 50000, 16384) == 8192
+        n = n + 1
+    if h2flow.sendable(conn, h2flow.window(65535), 50000, 16384) == 16384
+        n = n + 1
+    if h2flow.sendable(h2flow.window(500), one, 50000, 16384) == 500
+        n = n + 1
+    if h2flow.sendable(conn, h2flow.window(0), 1, 16384) == 0
+        n = n + 1
+    if h2flow.is_stalled(h2flow.window(0))
+        n = n + 1
+
+    // A retune may leave the window negative, and a device must respect
+    // that rather than clamping — 30000 against a 65535 initial window
+    // becomes -5535 when the gateway announces 30000.
+    match h2flow.retune(h2flow.window(30000), 0 - 35535)
+        Err(_) =>
+            n = n + 0
+        Ok(w)  =>
+            if w.available == 0 - 5535
+                n = n + 1
+            if h2flow.is_stalled(w)
+                n = n + 1
+
+    // Spending, receiving and crediting: the three a device does per
+    // frame.
+    match h2flow.spend(one, 1024)
+        Err(_) =>
+            n = n + 0
+        Ok(w)  =>
+            if w.available == 7168
+                n = n + 1
+
+    match h2flow.receive(one, 1024)
+        Err(_) =>
+            n = n + 0
+        Ok(w)  =>
+            if w.available == 7168
+                n = n + 1
+
+    match h2flow.credit(h2flow.window(0), 4096)
+        Err(_) =>
+            n = n + 0
+        Ok(w)  =>
+            if w.available == 4096
+                n = n + 1
+
+    // A WINDOW_UPDATE of zero is a protocol error rather than a no-op,
+    // and a device that tolerated it would hide its own stall.
+    match h2flow.credit(h2flow.window(0), 0)
+        Ok(_)  =>
+            n = n + 0
+        Err(_) =>
+            n = n + 1
+
+    // The credit a receiver owes is due on delivery, not on arrival —
+    // which on a device is the difference between back pressure and a
+    // buffer that overruns.
+    if h2flow.update_due(h2flow.window(65535), 65535, 2) == 0
+        n = n + 1
+    if h2flow.update_due(h2flow.deliver(h2flow.window(25535), 40000), 65535, 2) == 40000
+        n = n + 1
+    if h2flow.granted(h2flow.deliver(h2flow.window(25535), 40000), 40000).consumed == 0
+        n = n + 1
+
+    // ── HPACK's prefix integer, which a device reads out of a frame ───
+    match h2hpack.integer_of_bytes([0x1F as u8, 0x9A as u8, 0x0A as u8], 0, 5)
+        Err(_) =>
+            n = n + 0
+        Ok(v)  =>
+            if v.value == 1337
+                n = n + 1
+            if v.next == 3
+                n = n + 1
+
+    match h2hpack.integer_of_bytes([0x0A as u8], 0, 5)
+        Err(_) =>
+            n = n + 0
+        Ok(v)  =>
+            if v.value == 10
+                n = n + 1
+
+    if h2hpack.huffman_encoded_len("www.example.com") == 12
+        n = n + 1
+    if h2hpack.huffman_shorter("www.example.com")
+        n = n + 1
+
+    n
+
+@tier(rt)
+fn main() [hw, time]
+    bsp.board.init()
+    // 49 is the number of checks in `score`.  The count is printed on a
+    // failure rather than only compared, so a device that disagrees with
+    // the host says HOW MANY it lost and a bisect has somewhere to
+    // start.
+    let n = score()
+    if n == 49
+        hal.uart.write("PASS: http2-embedded\n")
+    else
+        hal.uart.write("FAIL: http2-embedded score=")
+        hal.uart.write(str.from_int(n))
+        hal.uart.write("\n")
+    loop
+        core.rt.sleep_ms(1000)

@@ -1,0 +1,188 @@
+// h2frame_tests.nv — the nine-byte header, the flag bits that mean two
+// things, and the frames that are not flow controlled.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: http2-nv.<module>.<fn>`.
+// That is the expected result until the bodies land.
+//
+// THE VECTORS ARE THE SPECIFICATION'S OWN.  RFC 9113 § 4.1 fixes the
+// header layout and § 6 fixes every type number and flag bit, so the
+// numbers below are quotations rather than choices, and a test that
+// disagrees with them is a port that has drifted.
+
+use std.test
+use std.list
+use h2err
+use h2frame
+
+@test
+fn test_the_frame_header_is_nine_bytes_and_the_reserved_bit_is_ignored() [io]
+    // § 4.1: a 24-bit length, an 8-bit type, an 8-bit flag set, a
+    // reserved bit and a 31-bit stream identifier.  The reserved bit
+    // MUST be ignored on receipt rather than refused — an endpoint that
+    // refused it breaks against any future use of the bit, which is the
+    // whole reason it is reserved.
+    test.case("the header is nine bytes")
+    test.assert(h2frame.H2_FRAME_HEADER_LEN == 9)
+
+    test.case("a SETTINGS ACK header parses to a zero-length frame on stream 0")
+    match h2frame.header_of_bytes([0 as u8, 0 as u8, 0 as u8, 0x04 as u8,
+                                   0x01 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8],
+                                   0)
+        Err(_) => test.assert(false)
+        Ok(h)  =>
+            test.assert(h.length == 0)
+            test.assert(h.stream == 0)
+            test.assert(h2frame.flag_ack(h.kind, h.flags))
+
+    test.case("the reserved top bit of the identifier is masked, not refused")
+    match h2frame.header_of_bytes([0 as u8, 0 as u8, 0 as u8, 0x00 as u8,
+                                   0x00 as u8, 0x80 as u8, 0 as u8, 0 as u8, 1 as u8],
+                                   0)
+        Err(_) => test.assert(false)
+        Ok(h)  => test.assert(h.stream == 1)
+
+    test.case("fewer than nine bytes is a fault, not a guess")
+    match h2frame.header_of_bytes([0 as u8, 0 as u8], 0)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_same_bit_means_two_things_on_two_frame_types() [io]
+    // 0x01 is END_STREAM on DATA and HEADERS and ACK on SETTINGS and
+    // PING.  A predicate that read the byte without knowing the type
+    // would report an acknowledged DATA frame, which is why every flag
+    // predicate here takes the kind.
+    test.case("0x01 on DATA is END_STREAM")
+    test.assert(h2frame.flag_end_stream(H2KindData, 0x01))
+
+    test.case("0x01 on SETTINGS is ACK and not END_STREAM")
+    test.assert(h2frame.flag_ack(H2KindSettings, 0x01))
+    test.assert(not h2frame.flag_end_stream(H2KindSettings, 0x01))
+
+    test.case("0x04 is END_HEADERS on HEADERS and on CONTINUATION")
+    test.assert(h2frame.flag_end_headers(H2KindHeaders, 0x04))
+    test.assert(h2frame.flag_end_headers(H2KindContinuation, 0x04))
+
+    test.case("0x20 is PRIORITY, and only on HEADERS")
+    test.assert(h2frame.flag_priority(H2KindHeaders, 0x20))
+    test.assert(not h2frame.flag_priority(H2KindData, 0x20))
+
+@test
+fn test_only_data_is_flow_controlled() [io]
+    // § 5.2.1, and the sentence a first implementation gets wrong in
+    // the safe direction and a second one in the expensive direction.
+    // WINDOW_UPDATE in particular must not be: if it were, a connection
+    // whose window had closed could never be reopened.
+    test.case("DATA is")
+    test.assert(h2frame.is_flow_controlled(H2KindData))
+
+    test.case("HEADERS is not")
+    test.assert(not h2frame.is_flow_controlled(H2KindHeaders))
+
+    test.case("and WINDOW_UPDATE is not, or nothing could ever unstall")
+    test.assert(not h2frame.is_flow_controlled(H2KindWindowUpdate))
+
+@test
+fn test_which_frames_name_a_stream_and_which_may_not() [io]
+    // § 4.1.  Getting it wrong is a connection error in both
+    // directions, and the two mistakes look identical from the outside.
+    test.case("DATA must name a stream")
+    test.assert(h2frame.needs_stream(H2KindData))
+
+    test.case("PING must not")
+    test.assert(h2frame.is_connection_scoped(H2KindPing))
+    test.assert(not h2frame.needs_stream(H2KindPing))
+
+    test.case("WINDOW_UPDATE may do either — stream 0 credits the connection")
+    test.assert(not h2frame.needs_stream(H2KindWindowUpdate))
+    test.assert(not h2frame.is_connection_scoped(H2KindWindowUpdate))
+
+@test
+fn test_an_unknown_frame_type_is_ignored_and_counted() [io]
+    // § 4.1 requires an unknown type to be ignored and discarded.  That
+    // is the extension point ALTSVC, ORIGIN and PRIORITY_UPDATE all
+    // arrived through, and refusing one is how an implementation breaks
+    // on the next extension.
+    test.case("an unrecognised number round-trips as itself")
+    let k = h2frame.frame_kind_of_num(0x40)
+    test.assert(h2frame.frame_kind_num(k) == 0x40)
+
+    test.case("and it is named rather than hidden")
+    test.assert(h2frame.frame_kind_name(k) != "")
+
+@test
+fn test_padding_that_eats_the_payload_is_a_fault_not_an_empty_body() [io]
+    // § 6.1 counts the padding-length byte itself in the frame length,
+    // so a padding length equal to the remaining payload is a
+    // connection error.  The two differ by one, and the wrong one lets
+    // a peer make a decoder read past its buffer.
+    test.case("one byte of payload claiming one byte of padding is a fault")
+    match h2frame.unpad([0x01 as u8], true)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("and an unpadded payload comes back whole")
+    match h2frame.unpad([0x41 as u8, 0x42 as u8], false)
+        Err(_)   => test.assert(false)
+        Ok(body) => test.assert(list.len(body) == 2)
+
+@test
+fn test_priority_is_parsed_and_never_acted_on() [io]
+    // § 5.3.1 deprecates the scheme.  Two things survive it: the weight
+    // is the wire byte PLUS ONE, which is the commonest off-by-one in a
+    // priority implementation, and a stream that depends on itself is a
+    // stream error even for an endpoint that ignores priority entirely.
+    test.case("the default weight is 16")
+    test.assert(h2frame.default_priority().weight == 16)
+
+    test.case("a self-dependency is refused")
+    test.assert(h2frame.priority_is_self_dependent(
+        3, H2Priority { depends_on: 3, weight: 16, exclusive: false }))
+
+    test.case("and a dependency on another stream is not")
+    test.assert(not h2frame.priority_is_self_dependent(
+        3, H2Priority { depends_on: 1, weight: 16, exclusive: false }))
+
+@test
+fn test_a_frame_size_error_is_the_connections_and_a_bad_header_is_one_streams() [io]
+    // § 5.4.  The single most consequential distinction in HTTP/2: tear
+    // down a connection for a stream error and ninety-nine calls die
+    // for the hundredth; recover a connection error as a stream error
+    // and the HPACK table stays desynchronised for ever.
+    test.case("a bad frame size ends the connection")
+    test.assert(h2err.is_connection_fault(H2BadFrameSize(0x03, 5)))
+
+    test.case("with FRAME_SIZE_ERROR")
+    test.assert(h2err.error_code_num(h2err.code_for(H2BadFrameSize(0x03, 5))) == 0x06)
+
+    test.case("an HPACK fault ALWAYS ends the connection — the table is shared")
+    test.assert(h2err.is_connection_fault(H2HpackBadIndex(99, 3)))
+    test.assert(h2err.error_code_num(h2err.code_for(H2HpackBadIndex(99, 3))) == 0x09)
+
+    test.case("a wrong stream state ends one stream")
+    test.assert(not h2err.is_connection_fault(H2WrongStreamState(3, "closed", 0x00)))
+
+@test
+fn test_the_error_code_numbers_are_the_specifications() [io]
+    // § 7's table, which is normative and which a port has no licence
+    // to renumber.
+    test.case("NO_ERROR is 0")
+    test.assert(h2err.error_code_num(H2ErrNoError) == 0x00)
+
+    test.case("REFUSED_STREAM is 7 — the one that makes a retry safe")
+    test.assert(h2err.error_code_num(H2ErrRefusedStream) == 0x07)
+
+    test.case("CANCEL is 8")
+    test.assert(h2err.error_code_num(H2ErrCancel) == 0x08)
+
+    test.case("COMPRESSION_ERROR is 9")
+    test.assert(h2err.error_code_num(H2ErrCompression) == 0x09)
+
+    test.case("an unknown code keeps its number for a relay to forward")
+    match h2err.error_code_of_num(0x20)
+        H2ErrUnknown(n) => test.assert(n == 0x20)
+        _               => test.assert(false)
+
+    test.case("and is HANDLED as INTERNAL_ERROR")
+    test.assert(h2err.error_code_num(h2err.effective_code(H2ErrUnknown(0x20))) == 0x02)

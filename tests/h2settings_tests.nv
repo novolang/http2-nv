@@ -1,0 +1,163 @@
+// h2settings_tests.nv — the defaults, the values that are refused, the
+// identifier that is ignored, and the h2c upgrade nobody should be
+// using and everybody is.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: http2-nv.<module>.<fn>`.
+
+use std.test
+use std.list
+use h2prelude
+use h2settings
+
+@test
+fn test_the_defaults_are_the_specifications_and_not_a_choice() [io]
+    // § 6.5.2's table, in force before either peer has said anything.
+    // A package that chose its own would have two endpoints disagreeing
+    // about the window for the first round trip of every connection.
+    let d = h2settings.default_settings()
+
+    test.case("the HPACK table starts at 4096")
+    test.assert(d.header_table_size == 4096)
+
+    test.case("push is enabled until somebody turns it off")
+    test.assert(d.enable_push)
+
+    test.case("concurrency is unlimited, and that is -1 rather than a large number")
+    test.assert(d.max_concurrent_streams == h2settings.unlimited())
+    test.assert(h2settings.unlimited() == 0 - 1)
+
+    test.case("the window is 65535")
+    test.assert(d.initial_window_size == 65535)
+
+    test.case("and the frame size is 16384, which is also the floor")
+    test.assert(d.max_frame_size == 16384)
+
+@test
+fn test_the_values_the_specification_refuses() [io]
+    // § 6.5.2.  Each of these is a connection error, and each of them is
+    // reachable by a peer that is merely buggy rather than hostile.
+    test.case("ENABLE_PUSH must be 0 or 1")
+    test.assert(h2settings.value_ok(H2SetEnablePush, 1))
+    test.assert(not h2settings.value_ok(H2SetEnablePush, 2))
+
+    test.case("INITIAL_WINDOW_SIZE must not exceed 2^31-1")
+    test.assert(h2settings.value_ok(H2SetInitialWindowSize, 2147483647))
+    test.assert(not h2settings.value_ok(H2SetInitialWindowSize, 2147483648))
+
+    test.case("MAX_FRAME_SIZE has a floor of 16384")
+    test.assert(not h2settings.value_ok(H2SetMaxFrameSize, 16383))
+    test.assert(h2settings.value_ok(H2SetMaxFrameSize, 16384))
+
+    test.case("and a ceiling of 16777215")
+    test.assert(h2settings.value_ok(H2SetMaxFrameSize, 16777215))
+    test.assert(not h2settings.value_ok(H2SetMaxFrameSize, 16777216))
+
+@test
+fn test_an_unknown_parameter_is_ignored_and_not_refused() [io]
+    // § 6.5.2 — the extension point the protocol is versioned through.
+    // Refusing one breaks against every peer that implements something
+    // newer, and the failure is a connection that never establishes.
+    test.case("an unrecognised identifier keeps its number")
+    match h2settings.setting_id_of_num(0x99)
+        H2SetUnknown(id) => test.assert(id == 0x99)
+        _                => test.assert(false)
+
+    test.case("any value for it is legal")
+    test.assert(h2settings.value_ok(H2SetUnknown(0x99), 12345))
+
+    test.case("and applying it changes nothing and does not fail")
+    match h2settings.apply(h2settings.default_settings(),
+                           H2Setting { id: H2SetUnknown(0x99), value: 12345 })
+        Err(_) => test.assert(false)
+        Ok(s)  => test.assert(s.max_frame_size == 16384)
+
+@test
+fn test_the_last_occurrence_in_one_frame_wins() [io]
+    // § 6.5 allows the same identifier twice in one frame and says the
+    // last one is in force.  A fold that short-circuited on the first
+    // occurrence resolves the wrong value, and the peer is already
+    // using the other one.
+    test.case("two MAX_FRAME_SIZE entries resolve to the second")
+    match h2settings.apply_all(h2settings.default_settings(),
+                               [H2Setting { id: H2SetMaxFrameSize, value: 32768 },
+                                H2Setting { id: H2SetMaxFrameSize, value: 65536 }])
+        Err(_) => test.assert(false)
+        Ok(s)  => test.assert(s.max_frame_size == 65536)
+
+    test.case("and one bad value stops the frame, because it ends the connection")
+    match h2settings.apply_all(h2settings.default_settings(),
+                               [H2Setting { id: H2SetMaxFrameSize, value: 1 },
+                                H2Setting { id: H2SetEnablePush, value: 0 }])
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_diff_is_what_a_peer_actually_sends() [io]
+    // Announcing six parameters when one changed costs thirty-six bytes
+    // on every reconfiguration and tells a reader of a packet capture
+    // nothing about what moved.
+    let d = h2settings.default_settings()
+
+    test.case("nothing changed, nothing announced")
+    test.assert(list.len(h2settings.diff(d, d)) == 0)
+
+    test.case("the full set is six entries")
+    test.assert(list.len(h2settings.to_list(d)) == 6)
+
+@test
+fn test_the_alpn_offer_puts_h2_first_because_order_is_preference() [io]
+    // Servers honour the order, so a list with `http/1.1` first
+    // negotiates HTTP/1.1 against every server that supports both — a
+    // one-line mistake with a symptom weeks away.
+    test.case("h2 is the identifier")
+    test.assert(h2prelude.H2_ALPN_ID == "h2")
+
+    test.case("and it is what the offer leads with")
+    match list.first(h2prelude.alpn_offer())
+        None    => test.assert(false)
+        Some(p) => test.assert(p == "h2")
+
+    test.case("a negotiated h2 is recognised, and an empty result is not")
+    test.assert(h2prelude.alpn_chose_h2("h2"))
+    test.assert(not h2prelude.alpn_chose_h2(""))
+
+@test
+fn test_the_h2c_upgrade_is_deprecated_and_still_parsed() [io]
+    // RFC 9113 § 3.1 removed it; every service mesh and every reverse
+    // proxy still speaks it.  The package says so rather than leaving a
+    // maintainer to discover it in a specification.
+    test.case("prior knowledge and ALPN are current")
+    test.assert(h2prelude.prelude_is_current(H2ViaAlpn))
+    test.assert(h2prelude.prelude_is_current(H2ViaPriorKnowledge))
+
+    test.case("the upgrade is not")
+    test.assert(not h2prelude.prelude_is_current(H2ViaUpgrade))
+
+    test.case("the upgraded request is stream 1, and it is already half-closed")
+    test.assert(h2prelude.upgraded_stream_id() == 1)
+
+    test.case("the header the settings travel in is named in the RFC")
+    test.assert(h2prelude.H2_SETTINGS_HEADER == "HTTP2-Settings")
+
+    test.case("and the token is h2c")
+    test.assert(h2prelude.H2_UPGRADE_TOKEN == "h2c")
+
+@test
+fn test_the_settings_payload_is_six_bytes_per_parameter() [io]
+    // A 16-bit identifier and a 32-bit value, § 6.5.1.  A value that
+    // decodes to a length that is not a multiple of six is a fault
+    // rather than an empty set: a server that silently used its
+    // defaults would be using different numbers from the client that is
+    // already sending against them.
+    test.case("six parameters is thirty-six bytes")
+    test.assert(list.len(h2prelude.settings_payload(h2settings.default_settings())) == 36)
+
+    test.case("a value that is not base64url is refused")
+    match h2prelude.settings_of_upgrade_value("not base64!")
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("the upgrade request adds three header lines, as six flat strings")
+    test.assert(list.len(
+        h2prelude.upgrade_request_headers(h2settings.default_settings())) == 6)

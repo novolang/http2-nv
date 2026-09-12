@@ -1,0 +1,294 @@
+// h2flow.nv — flow control as arithmetic on two integers, and the
+// WINDOW_UPDATE a caller owes because of it.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// FLOW CONTROL IS THE ONE PART OF HTTP/2 THAT IS PURE ARITHMETIC AND
+// STILL GETS EVERY IMPLEMENTATION ONCE.  There is no state machine
+// here, no parsing and no allocation: a window is a signed count of
+// bytes a sender may put on the wire, a WINDOW_UPDATE adds to it, a
+// DATA frame subtracts from it, and everything difficult about it is
+// that there are TWO windows on every byte and they are not the same
+// number.
+//
+// TWO WINDOWS, AND A SEND MAY NOT EXCEED EITHER.  § 5.2.1 gives the
+// connection one window and every stream its own, and a DATA frame is
+// counted against both.  A sender that consulted only the stream's
+// window starves every other stream on the connection; one that
+// consulted only the connection's exceeds a window a peer is entitled
+// to reset the stream over.  `sendable` is the minimum of the two and
+// the frame size, written once, and it is the function every caller of
+// this package should reach for instead of doing the comparison.
+//
+// A WINDOW MAY BE NEGATIVE AND THAT IS LEGAL.  § 6.9.2's retroactive
+// SETTINGS_INITIAL_WINDOW_SIZE change can push an open stream's send
+// window below zero; the sender then sends nothing until WINDOW_UPDATE
+// frames lift it back.  An implementation that clamps at zero sends
+// bytes the peer counts as a violation, and `retune` is the operation
+// that must not clamp.
+//
+// ONLY DATA IS FLOW CONTROLLED.  HEADERS, SETTINGS, PING, RST_STREAM
+// and WINDOW_UPDATE itself are not — and the last one is the important
+// one: if WINDOW_UPDATE were flow controlled, a connection whose window
+// had closed could never be reopened.  `h2frame.is_flow_controlled`
+// answers it for a frame kind; this module simply never counts anything
+// else.
+//
+// NOTHING HERE PERFORMS ANYTHING.  Every row in this module is `[]`.
+
+use h2err
+
+// The window every stream and the connection start with before either
+// peer announces anything: 65535, § 6.9.2.
+//
+// It is deliberately small, and it is why an HTTP/2 connection that
+// never sends a WINDOW_UPDATE transfers 64 KiB and stops.  A client
+// that felt "slow" and was fixed by "increasing a buffer" was almost
+// always this.
+pub const H2_DEFAULT_WINDOW = 65535
+
+// The largest a window may be, 2^31 - 1.  A WINDOW_UPDATE that would
+// take a window past it is a flow-control error rather than a clamp.
+pub const H2_MAX_WINDOW = 2147483647
+
+// One direction of one flow-control window.
+//
+// `available` is what may still be sent, or — on the receiving side —
+// what the peer may still send us.  It is signed and may be negative.
+//
+// `consumed` is what the application has taken delivery of and not yet
+// credited back.  It exists because the two questions "how much may the
+// peer still send" and "how much has my reader actually drained" are
+// different numbers, and the WINDOW_UPDATE a receiver owes is computed
+// from the second: a receiver that credited on arrival rather than on
+// delivery has no back pressure at all, which is the whole point of the
+// mechanism.
+pub struct H2Window
+    available: Int
+    consumed: Int
+
+// Why a window operation could not be applied.
+pub enum H2FlowFault
+    // A WINDOW_UPDATE would take the window past 2^31-1.  § 6.9.1 makes
+    // it a FLOW_CONTROL_ERROR — on a stream it resets the stream, on
+    // the connection it ends the connection.
+    H2FlowOverflow(window: Int, increment: Int)
+    // The peer sent more than the window allowed.  The sender's fault,
+    // and the receiver answers with a flow-control error.
+    H2FlowExceeded(window: Int, sent: Int)
+    // A WINDOW_UPDATE with an increment of zero.  § 6.9 makes it a
+    // PROTOCOL_ERROR rather than a no-op, because it is always a bug in
+    // the sender and tolerating it hides a stalled connection.
+    H2FlowZeroIncrement
+    // A retune by § 6.9.2 that would take the window below -2^31 or
+    // above 2^31-1.
+    H2FlowRetuneOutOfRange(window: Int, delta: Int)
+
+// The standard `Error` implementation, so a flow fault can be reported
+// by anything that reports errors.
+impl Error for H2FlowFault
+    // One line: which window, how large it was, and what was asked of
+    // it.  The numbers are in the message because "flow control error"
+    // on its own has never helped anybody.
+    fn message(self) -> Str
+        todo("http2-nv.h2flow.H2FlowFault.message")
+
+// A window with `initial` bytes available and nothing consumed.
+//
+// ```novo
+// use h2flow
+//
+// fn main() [io]
+//     println("${h2flow.window(65535).available}")
+// ```
+pub @tier(embedded)
+fn window(initial: Int) -> H2Window []
+    todo("http2-nv.h2flow.window")
+
+// How many bytes of `want` may be sent right now, against the
+// connection window, the stream window and the peer's maximum frame
+// size.
+//
+// THE MINIMUM OF THREE, AND THE FUNCTION THIS MODULE EXISTS FOR.  Every
+// sender needs it, none of the three may be exceeded, and every
+// implementation that wrote the comparison at the call site has written
+// it with two of the three at least once.  Answers 0 when the stream is
+// stalled, which is a normal condition and not a fault.
+//
+// ```novo
+// use h2flow
+//
+// fn main() [io]
+//     let c = h2flow.window(65535)
+//     let s = h2flow.window(1000)
+//     println("${h2flow.sendable(c, s, 50000, 16384)}")
+// ```
+pub @tier(embedded)
+fn sendable(conn: H2Window, stream: H2Window, want: Int, max_frame: Int) -> Int []
+    todo("http2-nv.h2flow.sendable")
+
+// The window after sending `n` bytes.
+//
+// Refuses rather than going negative: a negative window is reachable
+// only through § 6.9.2's retune, and a send that would produce one is a
+// bug in the caller rather than a legal state.
+//
+// ```novo
+// use h2flow
+//
+// fn main() [io]
+//     match h2flow.spend(h2flow.window(65535), 1024)
+//         Ok(w)  => println("${w.available}")
+//         Err(e) => println(e.message())
+// ```
+pub @tier(embedded)
+fn spend(w: H2Window, n: Int) -> Result<H2Window, H2FlowFault> []
+    todo("http2-nv.h2flow.spend")
+
+// The receiving window after `n` bytes arrived.
+//
+// Answers `H2FlowExceeded` when the peer sent more than it was allowed.
+// The bytes are still counted — a receiver that discarded them would
+// disagree with the sender about the window for the rest of the
+// connection — and the caller closes the stream or the connection.
+//
+// ```novo
+// use h2flow
+//
+// fn main() [io]
+//     match h2flow.receive(h2flow.window(65535), 1024)
+//         Ok(w)  => println("${w.available}")
+//         Err(e) => println(e.message())
+// ```
+pub @tier(embedded)
+fn receive(w: H2Window, n: Int) -> Result<H2Window, H2FlowFault> []
+    todo("http2-nv.h2flow.receive")
+
+// The window after the application took delivery of `n` bytes.
+//
+// Separate from `receive`, and the separation IS the back pressure: the
+// window shrinks when bytes arrive and the credit to reopen it is owed
+// only once the application has read them.  A receiver that credited on
+// arrival has an unbounded buffer wearing a flow-control mechanism.
+//
+// ```novo
+// use h2flow
+//
+// fn main() [io]
+//     println("${h2flow.deliver(h2flow.window(65535), 1024).consumed}")
+// ```
+pub @tier(embedded)
+fn deliver(w: H2Window, n: Int) -> H2Window []
+    todo("http2-nv.h2flow.deliver")
+
+// The window after a WINDOW_UPDATE of `increment` arrived.
+//
+// Refuses a zero increment (§ 6.9, PROTOCOL_ERROR) and an increment
+// that would take the window past 2^31-1 (§ 6.9.1, FLOW_CONTROL_ERROR).
+// The two are different error codes for two adjacent mistakes, which is
+// why they are different variants.
+//
+// ```novo
+// use h2flow
+//
+// fn main() [io]
+//     match h2flow.credit(h2flow.window(0), 65535)
+//         Ok(w)  => println("${w.available}")
+//         Err(e) => println(e.message())
+// ```
+pub @tier(embedded)
+fn credit(w: H2Window, increment: Int) -> Result<H2Window, H2FlowFault> []
+    todo("http2-nv.h2flow.credit")
+
+// How large a WINDOW_UPDATE this receiver should send now, or 0 for
+// none.
+//
+// The policy is the caller's and the arithmetic is here: credit when
+// what has been delivered and not yet credited reaches `initial`
+// divided by `divisor`.  Half — a divisor of 2 — is what every
+// deployed implementation uses, and a caller with a different opinion
+// passes a different number rather than reimplementing the comparison.
+//
+// 0 rather than an optional, because this is asked once per DATA frame
+// and a `?Int` would put a match in the hot path.
+//
+// ```novo
+// use h2flow
+//
+// fn main() [io]
+//     let w = h2flow.deliver(h2flow.window(65535), 40000)
+//     println("${h2flow.update_due(w, 65535, 2)}")
+// ```
+pub @tier(embedded)
+fn update_due(w: H2Window, initial: Int, divisor: Int) -> Int []
+    todo("http2-nv.h2flow.update_due")
+
+// The window after a WINDOW_UPDATE of `increment` has been SENT — the
+// credit given away and the consumed count reduced by the same amount.
+//
+// The other half of `update_due`: a receiver that announced credit and
+// did not clear its own counter announces it again on the next frame,
+// and a connection that sends a WINDOW_UPDATE per DATA frame is a
+// connection with no flow control and twice the packets.
+//
+// ```novo
+// use h2flow
+//
+// fn main() [io]
+//     let w = h2flow.deliver(h2flow.window(65535), 40000)
+//     println("${h2flow.granted(w, 40000).consumed}")
+// ```
+pub @tier(embedded)
+fn granted(w: H2Window, increment: Int) -> H2Window []
+    todo("http2-nv.h2flow.granted")
+
+// The window moved by § 6.9.2's retroactive delta, which may leave it
+// negative.
+//
+// `h2settings.window_delta` computes the delta; this applies it.  MUST
+// NOT clamp: a stream whose window goes to -5535 sends nothing until
+// 5536 bytes of credit arrive, and clamping to zero would have it send
+// 5535 bytes the peer counts as a violation.
+//
+// ```novo
+// use h2flow
+//
+// fn main() [io]
+//     match h2flow.retune(h2flow.window(30000), 0 - 35535)
+//         Ok(w)  => println("${w.available}")
+//         Err(e) => println(e.message())
+// ```
+pub @tier(embedded)
+fn retune(w: H2Window, delta: Int) -> Result<H2Window, H2FlowFault> []
+    todo("http2-nv.h2flow.retune")
+
+// Is this window closed — nothing may be sent against it?
+//
+// True at zero and below.  A stalled stream is the ordinary state of a
+// fast sender and a slow reader, and a host that treats it as a fault
+// has an error log the length of its transfer.
+//
+// ```novo
+// use h2flow
+//
+// fn main() [io]
+//     println("${h2flow.is_stalled(h2flow.window(0))}")
+// ```
+pub @tier(embedded)
+fn is_stalled(w: H2Window) -> Bool []
+    todo("http2-nv.h2flow.is_stalled")
+
+// The error code a flow fault is answered with.
+//
+// PROTOCOL_ERROR for a zero increment, FLOW_CONTROL_ERROR for the rest.
+// Published so the caller does not have to hold the mapping.
+//
+// ```novo
+// use h2err
+// use h2flow
+//
+// fn main() [io]
+//     println(h2err.error_code_name(h2flow.fault_code(H2FlowZeroIncrement)))
+// ```
+pub fn fault_code(f: H2FlowFault) -> H2ErrorCode []
+    todo("http2-nv.h2flow.fault_code")

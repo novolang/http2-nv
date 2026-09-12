@@ -1,0 +1,740 @@
+// h2conn.nv — the load-bearing interface: an HTTP/2 connection as a
+// value the host pumps, answering what it learned and what must be
+// done.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `H2Action` IS THE PACKAGE.  Everything else here is a frame, a window
+// or a state; this is the one type that says what the division of
+// labour is, and it says it in four variants: the host writes bytes,
+// the host closes the connection, the host arms a timer, and the host
+// stops waiting on a stream.  Nothing in this package opens a socket,
+// reads a clock or allocates a buffer it did not receive — the budget
+// is `[]` and there is no escape from it — so every call answers what
+// the caller must perform, and the caller is the only party that
+// performs.  That is the same shape grpc-codec-nv's `GrpcAction` has,
+// arrived at independently for the same reason, and the two compose:
+// gRPC's actions are this package's inputs.
+//
+// FEED AND DRAIN IN ONE STEP, and the step carries both lists.  A host
+// hands over whatever bytes the socket gave it and takes back
+// `H2Step`: the connection as it now is, the EVENTS it learned, and the
+// ACTIONS it owes.  Actions and events are separate lists rather than
+// one interleaved one because they go to different places — the events
+// go up to the application, the actions go down to the socket — and a
+// single list would have every host writing the same partition.
+//
+// ONE FEED CAN PRODUCE MANY EVENTS, which is where this differs from
+// http-codec-nv's one-event-per-call reader.  A single TCP segment
+// routinely carries frames for six streams, and a reader that answered
+// one event per call would make the host loop with no way to know when
+// to stop.  HTTP/1.1 has one message in flight and can afford the
+// simpler shape; HTTP/2 cannot.
+//
+// A HEADER BLOCK IS NEVER HANDED OVER IN PIECES.  CONTINUATION frames
+// are joined inside the connection and decoded once, because HPACK is
+// stateful across the connection and a decoder given half a block has a
+// dynamic table that matches nobody's.  The cost is that a header block
+// is held in memory until it is complete, which is exactly why
+// `H2Limits.max_continuation` exists: the 2024 CONTINUATION flood was
+// a peer sending an unbounded sequence of them, and a limit is the only
+// defence.
+//
+// WHAT THIS PACKAGE DOES NOT DO, on purpose: it does not schedule.
+// Which stream gets the next byte of a scarce connection window is a
+// policy question with no protocol answer — `h2flow.sendable` says how
+// much may go, the host decides for whom — and a `core` package that
+// chose would be choosing for a proxy, a browser and a device at once.
+// § 5.3's priority scheme is deprecated and not implemented, and
+// `h2frame` says so.
+//
+// NOTHING HERE PERFORMS ANYTHING.  Every row in this module is `[]`.
+
+use h2err
+use h2flow
+use h2settings
+use h2stream
+
+// Which end of the connection this is.
+//
+// Not a preference: the role decides the identifier parity, who sends
+// the preface, who may push, and which half of the stream state machine
+// is `local`.
+pub enum H2Role
+    H2RoleClient
+    H2RoleServer
+
+// What this endpoint will not grow past.
+//
+// Separate from `H2Settings` because settings are ANNOUNCED and these
+// are not: a peer learns the settings and obeys them, and it never
+// learns these.  Every one of them bounds memory against a peer that is
+// hostile rather than merely busy.
+pub struct H2Limits
+    // Bytes of joined header block, across a HEADERS and all its
+    // CONTINUATION frames.  The defence against the CONTINUATION flood.
+    max_continuation: Int
+    // Streams this endpoint will track at once, including the ones that
+    // are closed but still inside the flight-in-progress window.
+    max_tracked_streams: Int
+    // Bytes of undecoded frame this endpoint will buffer while waiting
+    // for the rest of a frame to arrive.
+    max_pending: Int
+    // WINDOW_UPDATE policy: credit when the delivered-and-uncredited
+    // count reaches the initial window divided by this.  2 is what every
+    // deployed implementation uses.
+    update_divisor: Int
+
+// One thing the connection learned, for the application above it.
+pub enum H2Event
+    // A stream this endpoint did not open has opened.  A server's
+    // request; a client's pushed response.
+    H2EvStreamOpened(stream: Int)
+    // A header block arrived and decoded.  `end_stream` set on the
+    // first HEADERS of a stream is a message with no body — a GET, or
+    // gRPC's trailers-only response.
+    H2EvHeaders(stream: Int, headers: [H2Header], end_stream: Bool)
+    // A header block arrived AFTER a body: trailers.  A separate event
+    // from `H2EvHeaders` because confusing the two is how a client
+    // reports a response's status as its request's, and because gRPC
+    // puts its status in the trailers and nowhere else.
+    H2EvTrailers(stream: Int, headers: [H2Header])
+    // Body bytes.  Not a whole anything: the number of these events for
+    // one body is an artefact of how the host read its socket.
+    H2EvData(stream: Int, data: [u8], end_stream: Bool)
+    // The stream is over.  `code` is `H2ErrNoError` for a normal end
+    // and the peer's code for a reset.
+    H2EvStreamClosed(stream: Int, code: H2ErrorCode)
+    // The peer's settings changed, and the resolved set is here.  A
+    // host that caches a frame size or a window size re-reads it now.
+    H2EvSettingsChanged(remote: H2Settings)
+    // A PING this endpoint sent came back.  The eight bytes are the
+    // ones that went out, so a round-trip measurement needs no sequence
+    // number of its own.
+    H2EvPingAcked(opaque: [u8])
+    // The peer is going away.  Every stream ABOVE `last_stream` was
+    // never processed, which is what makes those safe to retry even for
+    // a request that is not idempotent.
+    H2EvGoAway(last_stream: Int, code: H2ErrorCode, debug: [u8])
+    // A server promised a stream.  A client that announced
+    // SETTINGS_ENABLE_PUSH of 0 never sees this.
+    H2EvPushPromised(stream: Int, promised: Int, headers: [H2Header])
+    // A stalled stream may send again: its window opened.  The event a
+    // host waits on rather than polling `send_window` in a loop.
+    H2EvWindowOpened(stream: Int)
+
+// One thing the host must do.
+//
+// FOUR, and the smallness is the claim: everything else this package
+// might have wanted to do is arithmetic it can do itself.
+pub enum H2Action
+    // Write these bytes to the peer, in the order the actions came out.
+    // ORDER IS LOAD-BEARING: a SETTINGS acknowledgement that overtakes
+    // the frame it acknowledges, or a WINDOW_UPDATE that arrives before
+    // the RST_STREAM it credits, both put the peer's accounting out of
+    // step with this one.
+    H2DoSend(data: [u8])
+    // The connection is over.  The GOAWAY is already in an `H2DoSend`
+    // before this; this is the instruction to close the socket after
+    // writing it.
+    H2DoCloseConnection(code: H2ErrorCode, last_stream: Int)
+    // Stop waiting on this stream: it is closed and nothing more will
+    // arrive on it.  Separate from `H2EvStreamClosed` because that one
+    // is for the application and this one is for the host's own
+    // bookkeeping — a host with a table of pending calls clears an
+    // entry here.
+    H2DoDropStream(stream: Int)
+    // Expect a SETTINGS acknowledgement within this many milliseconds,
+    // and if it does not come, close the connection with
+    // SETTINGS_TIMEOUT.  A `core` package has no clock, so the timer is
+    // the host's; the number is the caller's own policy, echoed back at
+    // the moment it becomes relevant so a host does not have to know
+    // when to arm one.
+    H2DoExpectSettingsAck(within_ms: Int)
+
+// A connection.
+//
+// Opaque in the sense that matters: the fields are here because a
+// struct needs them, and a caller that reaches into one has coupled
+// itself to a buffering decision this package intends to change.  The
+// accessors below are what is anybody's business.
+//
+// TWO SETTINGS AND TWO HPACK TABLES, and that is the shape of the type:
+// `local` is what this endpoint announced and `remote` is what the peer
+// did; `decoder` is the table this endpoint maintains for blocks
+// arriving and `encoder` the one for blocks going out.  The pairs are
+// never equal and never interchangeable, and a connection that kept one
+// of each is a connection that works against itself and nothing else.
+pub struct H2Conn
+    role: H2Role
+    prelude: H2Prelude
+    limits: H2Limits
+    local: H2Settings
+    remote: H2Settings
+    decoder: H2Table
+    encoder: H2Table
+    conn_send: H2Window
+    conn_recv: H2Window
+    streams: [H2Stream]
+    highest_peer_stream: Int
+    next_local_stream: Int
+    pending: [u8]
+    goaway_last: Int
+
+// A connection, the events it produced and the actions it owes.
+//
+// A struct rather than a tuple, for the reason http-codec-nv gives for
+// its own: the caller reassigns one field and iterates the other two,
+// and destructuring three things to use them in three places reads
+// worse every time.
+pub struct H2Step
+    conn: H2Conn
+    events: [H2Event]
+    actions: [H2Action]
+
+// A connection and the stream that was just opened on it.
+pub struct H2Opened
+    conn: H2Conn
+    stream: Int
+
+// A connection, the actions a send produced, and how many bytes of the
+// caller's data were actually taken.
+//
+// `taken` is the whole of flow control from a caller's side: a send of
+// 100 KiB against a 16 KiB window takes 16 KiB and the caller sends the
+// rest when `H2EvWindowOpened` arrives.  A `send_data` that answered
+// `Unit` would either block — which a `core` package cannot do — or
+// silently buffer the remainder, which is an unbounded queue with no
+// name.
+pub struct H2Sent
+    conn: H2Conn
+    actions: [H2Action]
+    taken: Int
+
+// A 16 KiB continuation ceiling, 256 tracked streams, 64 KiB pending
+// and a divisor of 2.
+//
+// The numbers a server on the open internet survives with, in the same
+// spirit as http-codec-nv's own defaults.
+//
+// ```novo
+// use h2conn
+//
+// fn main() [io]
+//     println("${h2conn.default_limits().update_divisor}")
+// ```
+pub fn default_limits() -> H2Limits []
+    todo("http2-nv.h2conn.default_limits")
+
+// A 2 KiB continuation ceiling, 4 tracked streams, 4 KiB pending and a
+// divisor of 2.
+//
+// What a microcontroller can hold beside everything else, paired with
+// `h2settings.embedded_settings`.  Named here rather than invented per
+// caller, for the same reason that one is.
+//
+// ```novo
+// use h2conn
+//
+// fn main() [io]
+//     println("${h2conn.embedded_limits().max_tracked_streams}")
+// ```
+pub fn embedded_limits() -> H2Limits []
+    todo("http2-nv.h2conn.embedded_limits")
+
+// A client connection that has not sent anything yet.
+//
+// ```novo
+// use h2conn
+// use h2prelude
+// use h2settings
+//
+// fn main() [io]
+//     let c = h2conn.client(H2ViaAlpn, h2conn.default_limits(),
+//                           h2settings.default_settings())
+//     println("${h2conn.is_open(c)}")
+// ```
+pub fn client(p: H2Prelude, limits: H2Limits, local: H2Settings) -> H2Conn []
+    todo("http2-nv.h2conn.client")
+
+// A server connection that has not received anything yet.
+//
+// An `H2ViaUpgrade` server starts with stream 1 already open and
+// half-closed (remote), because the HTTP/1.1 request that asked for the
+// upgrade IS that stream and its body has already finished arriving.
+// A server that opened stream 1 fresh loses the request.
+//
+// ```novo
+// use h2conn
+// use h2prelude
+// use h2settings
+//
+// fn main() [io]
+//     let c = h2conn.server(H2ViaPriorKnowledge, h2conn.default_limits(),
+//                           h2settings.default_settings())
+//     println("${h2conn.open_count(c)}")
+// ```
+pub fn server(p: H2Prelude, limits: H2Limits, local: H2Settings) -> H2Conn []
+    todo("http2-nv.h2conn.server")
+
+// The bytes this endpoint owes before anything else: the preface for a
+// client, and this endpoint's SETTINGS for both.
+//
+// Called once, before the first `feed`.  A client sends the preface and
+// its SETTINGS together and does not wait for the server's — waiting
+// adds a round trip to every connection and the specification does not
+// ask for it.
+//
+// ```novo
+// use std.list
+// use h2conn
+// use h2prelude
+// use h2settings
+//
+// fn main() [io]
+//     let step = h2conn.start(h2conn.client(H2ViaAlpn, h2conn.default_limits(),
+//                                           h2settings.default_settings()))
+//     println("${list.len(step.actions)}")
+// ```
+pub fn start(c: H2Conn) -> H2Step []
+    todo("http2-nv.h2conn.start")
+
+// Bytes from the peer in, events and actions out.
+//
+// Consumes as many whole frames as the chunk completes and keeps the
+// remainder.  A chunk that completes no frame is not a fault: on a
+// socket it is the ordinary case, and the step comes back with empty
+// lists.
+//
+// A fault here is the peer's.  `h2err.is_connection_fault` says whether
+// the connection is over, and `h2err.code_for` says what the peer is
+// owed — and the actions to send it are NOT in this answer, because a
+// `Result`'s error arm carries one value.  `fault_actions` is how a
+// host turns the fault into the frames it owes.
+//
+// ```novo
+// use std.list
+// use h2conn
+// use h2prelude
+// use h2settings
+//
+// fn main() [io]
+//     let c = h2conn.client(H2ViaAlpn, h2conn.default_limits(),
+//                           h2settings.default_settings())
+//     match h2conn.feed(c, [])
+//         Ok(step) => println("${list.len(step.events)}")
+//         Err(e)   => println(e.message())
+// ```
+pub fn feed(c: H2Conn, chunk: [u8]) -> Result<H2Step, H2DecodeError> []
+    todo("http2-nv.h2conn.feed")
+
+// The frames a host owes its peer because of a decode fault, and the
+// connection as it stands afterwards.
+//
+// Its own function because `feed`'s error arm carries one value and the
+// answer to a fault is two: a RST_STREAM or a GOAWAY to write, and a
+// connection that has recorded which.  A host that skipped this and
+// simply closed the socket leaves the peer to time out, which is the
+// difference between a clean failure and a hung request.
+//
+// ```novo
+// use std.list
+// use h2conn
+// use h2prelude
+// use h2settings
+//
+// fn main() [io]
+//     let c = h2conn.client(H2ViaAlpn, h2conn.default_limits(),
+//                           h2settings.default_settings())
+//     println("${list.len(h2conn.fault_actions(c, H2HpackBadIndex(99, 3)).actions)}")
+// ```
+pub fn fault_actions(c: H2Conn, e: H2DecodeError) -> H2Step []
+    todo("http2-nv.h2conn.fault_actions")
+
+// A new stream this endpoint opens, with its identifier.
+//
+// The identifier is the connection's to choose — odd and increasing for
+// a client — which is why this answers one rather than taking one.
+// Refuses when the identifier space is exhausted, when the peer's
+// SETTINGS_MAX_CONCURRENT_STREAMS is reached, and when a GOAWAY has
+// arrived.
+//
+// ```novo
+// use h2conn
+// use h2prelude
+// use h2settings
+//
+// fn main() [io]
+//     let c = h2conn.client(H2ViaAlpn, h2conn.default_limits(),
+//                           h2settings.default_settings())
+//     match h2conn.open_stream(c)
+//         Ok(o)  => println("${o.stream}")
+//         Err(e) => println(e.message())
+// ```
+pub fn open_stream(c: H2Conn) -> Result<H2Opened, H2EncodeError> []
+    todo("http2-nv.h2conn.open_stream")
+
+// A header block written on a stream: HPACK-encoded, split into a
+// HEADERS and as many CONTINUATION frames as the peer's frame size
+// needs.
+//
+// The split is here rather than in the caller because it is the peer's
+// SETTINGS_MAX_FRAME_SIZE that decides it and because a block split
+// wrongly is a connection error — the frames must be adjacent on the
+// connection, with nothing for any other stream between them.
+//
+// ```novo
+// use std.list
+// use h2conn
+// use h2prelude
+// use h2settings
+//
+// fn main() [io]
+//     let c = h2conn.client(H2ViaAlpn, h2conn.default_limits(),
+//                           h2settings.default_settings())
+//     match h2conn.send_headers(c, 1, [], false)
+//         Ok(step) => println("${list.len(step.actions)}")
+//         Err(e)   => println(e.message())
+// ```
+pub fn send_headers(c: H2Conn, stream: Int, headers: [H2Header],
+                    end_stream: Bool) -> Result<H2Step, H2EncodeError> []
+    todo("http2-nv.h2conn.send_headers")
+
+// Trailers on a stream: a HEADERS frame with END_STREAM set, and the
+// stream is finished from this side.
+//
+// A separate call from `send_headers` because a transport has to know
+// which it is — trailers may carry no pseudo-headers, and a stream
+// sends exactly one set — and because gRPC's status lives here and
+// nowhere else.
+//
+// ```novo
+// use std.list
+// use h2conn
+// use h2prelude
+// use h2settings
+//
+// fn main() [io]
+//     let c = h2conn.server(H2ViaPriorKnowledge, h2conn.default_limits(),
+//                           h2settings.default_settings())
+//     match h2conn.send_trailers(c, 1, [])
+//         Ok(step) => println("${list.len(step.actions)}")
+//         Err(e)   => println(e.message())
+// ```
+pub fn send_trailers(c: H2Conn, stream: Int,
+                     headers: [H2Header]) -> Result<H2Step, H2EncodeError> []
+    todo("http2-nv.h2conn.send_trailers")
+
+// Body bytes on a stream, up to what the windows and the frame size
+// allow, answering how many were taken.
+//
+// TAKES WHAT IT CAN AND SAYS SO.  The connection window, the stream
+// window and the peer's maximum frame size are three separate ceilings
+// (`h2flow.sendable`), and a caller with 100 KiB against a 16 KiB
+// window gets `taken` of 16384 and sends the rest when
+// `H2EvWindowOpened` arrives for that stream.  `taken` of 0 is a
+// stalled stream, which is ordinary.
+//
+// `end_stream` is applied only if the whole of `data` was taken — a
+// partial send that closed the stream would truncate the body, and
+// that is the bug this signature exists to make impossible.
+//
+// ```novo
+// use h2conn
+// use h2prelude
+// use h2settings
+//
+// fn main() [io]
+//     let c = h2conn.client(H2ViaAlpn, h2conn.default_limits(),
+//                           h2settings.default_settings())
+//     match h2conn.send_data(c, 1, [], true)
+//         Ok(s)  => println("${s.taken}")
+//         Err(e) => println(e.message())
+// ```
+pub fn send_data(c: H2Conn, stream: Int, data: [u8],
+                 end_stream: Bool) -> Result<H2Sent, H2EncodeError> []
+    todo("http2-nv.h2conn.send_data")
+
+// A RST_STREAM on a stream.
+//
+// What a cancelled call and an expired deadline both end with, and what
+// makes a server stop working on something nobody is waiting for.
+//
+// ```novo
+// use std.list
+// use h2conn
+// use h2prelude
+// use h2settings
+//
+// fn main() [io]
+//     let c = h2conn.client(H2ViaAlpn, h2conn.default_limits(),
+//                           h2settings.default_settings())
+//     match h2conn.reset_stream(c, 1, H2ErrCancel)
+//         Ok(step) => println("${list.len(step.actions)}")
+//         Err(e)   => println(e.message())
+// ```
+pub fn reset_stream(c: H2Conn, stream: Int, code: H2ErrorCode) -> Result<H2Step, H2EncodeError> []
+    todo("http2-nv.h2conn.reset_stream")
+
+// A GOAWAY, and the connection marked as going away.
+//
+// Never fails: a connection that is already going away sends a second
+// GOAWAY with a lower `last_stream`, which § 6.8 explicitly allows as
+// the graceful-shutdown sequence — announce, wait, announce again with
+// the streams that actually finished.
+//
+// ```novo
+// use std.list
+// use h2conn
+// use h2prelude
+// use h2settings
+//
+// fn main() [io]
+//     let c = h2conn.server(H2ViaPriorKnowledge, h2conn.default_limits(),
+//                           h2settings.default_settings())
+//     println("${list.len(h2conn.go_away(c, H2ErrNoError, "").actions)}")
+// ```
+pub fn go_away(c: H2Conn, code: H2ErrorCode, debug: Str) -> H2Step []
+    todo("http2-nv.h2conn.go_away")
+
+// A PING with eight opaque bytes.
+//
+// Refuses a payload that is not exactly eight bytes rather than padding
+// it, because a peer's ACK echoes what it received and a caller
+// matching on what it sent would never find it.
+//
+// ```novo
+// use std.list
+// use h2conn
+// use h2prelude
+// use h2settings
+//
+// fn main() [io]
+//     let c = h2conn.client(H2ViaAlpn, h2conn.default_limits(),
+//                           h2settings.default_settings())
+//     match h2conn.ping(c, [])
+//         Ok(step) => println("${list.len(step.actions)}")
+//         Err(e)   => println(e.message())
+// ```
+pub fn ping(c: H2Conn, opaque: [u8]) -> Result<H2Step, H2EncodeError> []
+    todo("http2-nv.h2conn.ping")
+
+// New local settings announced to the peer.
+//
+// The SETTINGS frame goes out and the new values do NOT take effect
+// here until the peer acknowledges — § 6.5.3's rule, and the one that a
+// straightforward implementation gets backwards: an endpoint that
+// applied its own new SETTINGS_INITIAL_WINDOW_SIZE immediately would
+// accept data against a window the peer has not yet started using.
+// The action list carries `H2DoExpectSettingsAck`.
+//
+// ```novo
+// use std.list
+// use h2conn
+// use h2prelude
+// use h2settings
+//
+// fn main() [io]
+//     let c = h2conn.client(H2ViaAlpn, h2conn.default_limits(),
+//                           h2settings.default_settings())
+//     println("${list.len(h2conn.announce(c, h2settings.embedded_settings(), 10000).actions)}")
+// ```
+pub fn announce(c: H2Conn, next: H2Settings, ack_within_ms: Int) -> H2Step []
+    todo("http2-nv.h2conn.announce")
+
+// The application took delivery of `n` body bytes on a stream, so the
+// credit it owes may now be announced.
+//
+// The other half of flow control, and the one a host forgets: the
+// window shrank when the bytes ARRIVED and reopens only when they have
+// been read.  A host that never calls this transfers one window's worth
+// and stops, which is the single most common "HTTP/2 is slow" report.
+// The WINDOW_UPDATE frames — for the stream and for the connection —
+// are in the actions, or the list is empty when the policy says not
+// yet.
+//
+// ```novo
+// use std.list
+// use h2conn
+// use h2prelude
+// use h2settings
+//
+// fn main() [io]
+//     let c = h2conn.server(H2ViaPriorKnowledge, h2conn.default_limits(),
+//                           h2settings.default_settings())
+//     println("${list.len(h2conn.delivered(c, 1, 8192).actions)}")
+// ```
+pub fn delivered(c: H2Conn, stream: Int, n: Int) -> H2Step []
+    todo("http2-nv.h2conn.delivered")
+
+// How many body bytes may be sent on this stream right now.
+//
+// The minimum of the connection window, the stream window and the
+// peer's frame size — `h2flow.sendable` asked of a whole connection, so
+// a caller does not have to find the two windows itself.  0 means
+// stalled.
+//
+// ```novo
+// use h2conn
+// use h2prelude
+// use h2settings
+//
+// fn main() [io]
+//     let c = h2conn.client(H2ViaAlpn, h2conn.default_limits(),
+//                           h2settings.default_settings())
+//     println("${h2conn.send_window(c, 1)}")
+// ```
+pub fn send_window(c: H2Conn, stream: Int) -> Int []
+    todo("http2-nv.h2conn.send_window")
+
+// Where a stream is, or `H2StIdle` for one this connection has never
+// seen.
+//
+// ```novo
+// use h2conn
+// use h2prelude
+// use h2settings
+// use h2stream
+//
+// fn main() [io]
+//     let c = h2conn.client(H2ViaAlpn, h2conn.default_limits(),
+//                           h2settings.default_settings())
+//     println(h2stream.state_name(h2conn.stream_state(c, 1)))
+// ```
+pub fn stream_state(c: H2Conn, stream: Int) -> H2StreamState []
+    todo("http2-nv.h2conn.stream_state")
+
+// How many streams are open — the number
+// SETTINGS_MAX_CONCURRENT_STREAMS bounds.
+//
+// Open means open or half-closed, § 5.1.2: a closed stream inside the
+// flight-in-progress window is tracked and does not count, and an
+// implementation that counted it refuses requests it could serve.
+//
+// ```novo
+// use h2conn
+// use h2prelude
+// use h2settings
+//
+// fn main() [io]
+//     let c = h2conn.client(H2ViaAlpn, h2conn.default_limits(),
+//                           h2settings.default_settings())
+//     println("${h2conn.open_count(c)}")
+// ```
+pub fn open_count(c: H2Conn) -> Int []
+    todo("http2-nv.h2conn.open_count")
+
+// May a new stream still be opened and driven on this connection?
+//
+// False once a GOAWAY has been sent or received.  The one question a
+// channel asks before every call, which is why it costs nothing at all
+// — a question that cost `[io]` is a question callers start caching.
+//
+// ```novo
+// use h2conn
+// use h2prelude
+// use h2settings
+//
+// fn main() [io]
+//     let c = h2conn.client(H2ViaAlpn, h2conn.default_limits(),
+//                           h2settings.default_settings())
+//     println("${h2conn.is_open(c)}")
+// ```
+pub fn is_open(c: H2Conn) -> Bool []
+    todo("http2-nv.h2conn.is_open")
+
+// The `last_stream` of a GOAWAY that arrived, or `None`.
+//
+// What a retry decision reads: a stream ABOVE this number was never
+// processed, so re-sending it cannot do the work twice — which is the
+// one condition that makes a non-idempotent retry safe, and the one
+// grpc-nv's `never_processed` is asking about.
+//
+// ```novo
+// use h2conn
+// use h2prelude
+// use h2settings
+//
+// fn main() [io]
+//     let c = h2conn.client(H2ViaAlpn, h2conn.default_limits(),
+//                           h2settings.default_settings())
+//     match h2conn.goaway_last_stream(c)
+//         Some(n) => println("${n}")
+//         None    => println("no goaway")
+// ```
+pub fn goaway_last_stream(c: H2Conn) -> ?Int []
+    todo("http2-nv.h2conn.goaway_last_stream")
+
+// Was this stream certainly never processed by the peer?
+//
+// True for a stream above a received GOAWAY's `last_stream` and for one
+// the peer reset with REFUSED_STREAM, and false for everything else.
+// Published here because grpc-nv asks exactly this question of its
+// transport and answers it today from a fault type it invents; with
+// this package underneath, the two agree by construction instead of by
+// a table somebody keeps in step.
+//
+// ```novo
+// use h2conn
+// use h2prelude
+// use h2settings
+//
+// fn main() [io]
+//     let c = h2conn.client(H2ViaAlpn, h2conn.default_limits(),
+//                           h2settings.default_settings())
+//     println("${h2conn.never_processed(c, 9)}")
+// ```
+pub fn never_processed(c: H2Conn, stream: Int) -> Bool []
+    todo("http2-nv.h2conn.never_processed")
+
+// What this endpoint announced.
+//
+// ```novo
+// use h2conn
+// use h2prelude
+// use h2settings
+//
+// fn main() [io]
+//     let c = h2conn.client(H2ViaAlpn, h2conn.default_limits(),
+//                           h2settings.default_settings())
+//     println("${h2conn.local_settings(c).max_frame_size}")
+// ```
+pub fn local_settings(c: H2Conn) -> H2Settings []
+    todo("http2-nv.h2conn.local_settings")
+
+// What the peer announced.
+//
+// The copy a sender consults, and the reason `h2settings` says so
+// loudly that there are two.
+//
+// ```novo
+// use h2conn
+// use h2prelude
+// use h2settings
+//
+// fn main() [io]
+//     let c = h2conn.client(H2ViaAlpn, h2conn.default_limits(),
+//                           h2settings.default_settings())
+//     println("${h2conn.remote_settings(c).max_frame_size}")
+// ```
+pub fn remote_settings(c: H2Conn) -> H2Settings []
+    todo("http2-nv.h2conn.remote_settings")
+
+// The bytes a host has fed that do not yet make a whole frame.
+//
+// Published so a host can see its own buffer growing against
+// `H2Limits.max_pending` rather than discovering it as an allocation
+// failure.
+//
+// ```novo
+// use h2conn
+// use h2prelude
+// use h2settings
+//
+// fn main() [io]
+//     let c = h2conn.client(H2ViaAlpn, h2conn.default_limits(),
+//                           h2settings.default_settings())
+//     println("${h2conn.pending_bytes(c)}")
+// ```
+pub fn pending_bytes(c: H2Conn) -> Int []
+    todo("http2-nv.h2conn.pending_bytes")

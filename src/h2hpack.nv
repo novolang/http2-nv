@@ -1,0 +1,641 @@
+// h2hpack.nv — RFC 7541: the static table as data, the dynamic table as
+// a value the caller sizes, Huffman as data, and the two integer
+// encodings everything else is written in.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// HPACK IS THE REASON HTTP/2 CANNOT BE SPOKEN STATELESSLY.  A header
+// block is not self-describing: an index in it refers to a table both
+// peers have been building since the connection opened, so a decoder
+// that skips a block, decodes one out of order, or gives up halfway has
+// a table that no longer matches the encoder's and every later block on
+// the connection decodes to something nobody sent.  That is why a
+// COMPRESSION_ERROR is always a connection error in `h2err`, and why
+// `h2conn` never hands this module half a block.
+//
+// THE DYNAMIC TABLE IS A VALUE THE CALLER SIZES AND THREADS.  Not a
+// hidden singleton and not an allocation this package decides: `H2Table`
+// carries its own maximum, `table_insert` evicts to fit, and a caller
+// that wants no dynamic table at all passes a maximum of zero and gets
+// a decoder that answers every static index and refuses every dynamic
+// one.  A device does exactly that, and the `@tier(embedded)` claim in
+// this module is drawn exactly there: the LOOKUPS carry it, because a
+// device already holds the name it is asking about and wants an `Int`
+// back, and the functions that ANSWER a table — `static_table`,
+// `huffman_codes`, `huffman_lengths` — do not, because building a list
+// of 61 or 257 entries is the allocation the claim is supposed to
+// exclude.
+//
+// THE NEVER-INDEXED BIT IS A SECURITY DECISION AND IT TRAVELS.  § 7.1.3
+// gives a header a representation that says "do not put this in a
+// table, and do not let an intermediary put it in one either".  It is
+// what an `authorization` header or a cookie with a session identifier
+// gets, because a compression table shared across requests is what
+// CRIME and BREACH read secrets out of.  So `never_indexed` is a field
+// on the header and not a flag on the encoder: the decision belongs to
+// whoever knows what the value is, it must survive being decoded and
+// re-encoded by a proxy, and an encoder that took it as a call-site
+// argument would lose it on the first relay.
+//
+// HUFFMAN IS EMITTED ONLY WHEN IT IS SHORTER, § 5.2.  The code is
+// optimised for the characters that occur in headers, so a base64 blob
+// or a UTF-8 path gets LONGER.  An encoder that always Huffman-coded
+// would inflate exactly the headers that are already large.
+//
+// NOTHING HERE PERFORMS ANYTHING.  Every row in this module is `[]`.
+
+// The number of entries in the static table: 61, RFC 7541 appendix A.
+pub const H2_STATIC_TABLE_LEN = 61
+
+// HPACK's per-entry overhead in the table's own accounting, § 4.1: a
+// name, a value, and 32 bytes for whatever the implementation's
+// bookkeeping costs.
+pub const H2_ENTRY_OVERHEAD = 32
+
+// One name and one value, as a table holds them.
+//
+// Values as `Str` rather than `[u8]`: HTTP/2 field values are a byte
+// sequence, but every consumer on this grid — grpc-codec-nv's metadata,
+// a router, a log — reads them as text, and a `[u8]` surface would put
+// a conversion at every call site instead of one place.  A value that
+// is truly binary travels base64 in a `-bin` header, which is gRPC's
+// own convention and the only one in use.
+pub struct H2Entry
+    name: Str
+    value: Str
+
+// One header, with the indexing decision that belongs to it.
+//
+// `never_indexed` rather than a three-way enum on the encoder, because
+// the other two representations — indexed and not-indexed-this-time —
+// are an encoder's size decision that a caller has no information
+// about, and this one is a security property of the VALUE that must
+// survive a relay.  `indexing_of` is how an encoder reads it.
+pub struct H2Header
+    name: Str
+    value: Str
+    never_indexed: Bool
+
+// How a header may be put on the wire, RFC 7541 § 6.2.
+pub enum H2Indexing
+    // § 6.2.1 — put it in the dynamic table; both peers add it.  What a
+    // repeated header wants.
+    H2IndexIncremental
+    // § 6.2.2 — do not add it, but an intermediary may.  What a header
+    // that will not repeat wants.
+    H2IndexNone
+    // § 6.2.3 — do not add it, and no intermediary may either.  What a
+    // credential wants.
+    H2IndexNever
+
+// The dynamic table, as a value.
+//
+// `max_size` is what the peer's SETTINGS_HEADER_TABLE_SIZE allows and
+// `size` is what the entries currently cost by § 4.1's accounting.
+// `entries` is newest first, because HPACK's indices count that way and
+// a list held the other way round would put a subtraction in every
+// lookup.
+pub struct H2Table
+    max_size: Int
+    size: Int
+    entries: [H2Entry]
+
+// A prefix integer read off the wire, and where reading it stopped.
+//
+// A struct rather than a tuple in a `Result`, because the two halves
+// are used at different places: the value goes into a decision and the
+// offset goes back into the loop.
+pub struct H2VarInt
+    value: Int
+    next: Int
+
+// A string read off the wire, and where reading it stopped.
+pub struct H2VarStr
+    text: Str
+    next: Int
+
+// An encoder's answer: the table as the encode left it, and the buffer
+// with the block appended.
+//
+// The table comes back because HPACK's encoder is stateful — an
+// incrementally-indexed header changed it — and a caller that dropped
+// the new table would desynchronise from its own peer on the next
+// block.
+pub struct H2Encoded
+    table: H2Table
+    out: [u8]
+
+// A decoder's answer: the table as the decode left it, and the headers.
+pub struct H2Decoded
+    table: H2Table
+    headers: [H2Header]
+
+// The sixty-one entries of RFC 7541 appendix A, in index order.
+//
+// DATA, not a function with a `match` in it, because a device holds it
+// in `.rodata` and because the table is normative: a single wrong entry
+// makes one header in a hundred decode to something else, on a
+// connection that is otherwise working, and the symptom shows up as a
+// routing bug months later.  A test compares this list against the
+// appendix entry by entry.
+//
+// ```novo
+// use std.list
+// use h2hpack
+//
+// fn main() [io]
+//     println("${list.len(h2hpack.static_table())}")
+// ```
+pub fn static_table() -> [H2Entry] []
+    todo("http2-nv.h2hpack.static_table")
+
+// The entry at a static index, 1-based, or `None` above 61.
+//
+// 1-based because HPACK is: index 0 is not an entry, it is the marker
+// that a literal name follows, and an implementation that stored the
+// table 0-based has an off-by-one in every decode.
+//
+// ```novo
+// use h2hpack
+//
+// fn main() [io]
+//     match h2hpack.static_at(2)
+//         Some(e) => println("${e.name}: ${e.value}")
+//         None    => println("no such index")
+// ```
+pub fn static_at(index: Int) -> ?H2Entry []
+    todo("http2-nv.h2hpack.static_at")
+
+// The static index of this exact name and value, or 0.
+//
+// 0 for absent, because 0 is not a valid index and a `?Int` would put a
+// match in the encoder's innermost loop.
+//
+// ```novo
+// use h2hpack
+//
+// fn main() [io]
+//     println("${h2hpack.static_index_of(":method", "GET")}")
+// ```
+pub @tier(embedded)
+fn static_index_of(name: Str, value: Str) -> Int []
+    todo("http2-nv.h2hpack.static_index_of")
+
+// The lowest static index with this name, whatever its value, or 0.
+//
+// The other half of an encoder's lookup: a `:path` of `/api/v1/users`
+// matches no entry by value and still encodes as index 4 with a literal
+// value, which is two bytes instead of seven.
+//
+// ```novo
+// use h2hpack
+//
+// fn main() [io]
+//     println("${h2hpack.static_index_of_name("content-type")}")
+// ```
+pub @tier(embedded)
+fn static_index_of_name(name: Str) -> Int []
+    todo("http2-nv.h2hpack.static_index_of_name")
+
+// An empty dynamic table that will hold at most `max_size` bytes by
+// § 4.1's accounting.
+//
+// ```novo
+// use h2hpack
+//
+// fn main() [io]
+//     println("${h2hpack.table(4096).max_size}")
+// ```
+pub fn table(max_size: Int) -> H2Table []
+    todo("http2-nv.h2hpack.table")
+
+// What one entry costs the table: its name plus its value plus 32.
+//
+// § 4.1's formula, published because a caller sizing a table for a
+// device needs it and because it is the number `table_insert` evicts
+// against.
+//
+// ```novo
+// use h2hpack
+//
+// fn main() [io]
+//     println("${h2hpack.entry_size(H2Entry { name: "a", value: "b" })}")
+// ```
+pub fn entry_size(e: H2Entry) -> Int []
+    todo("http2-nv.h2hpack.entry_size")
+
+// The table with this entry added at index 1, evicting from the end
+// until it fits.
+//
+// An entry LARGER than the whole table empties the table and is not
+// added, § 4.4 — not an error, and not a table that grows past its
+// maximum.  That is the rule a naive eviction loop turns into an
+// infinite loop or an overflow.
+//
+// ```novo
+// use h2hpack
+//
+// fn main() [io]
+//     let t = h2hpack.table_insert(h2hpack.table(4096),
+//                                  H2Entry { name: "x-run", value: "7" })
+//     println("${t.size}")
+// ```
+pub fn table_insert(t: H2Table, e: H2Entry) -> H2Table []
+    todo("http2-nv.h2hpack.table_insert")
+
+// The table resized, evicting from the end until it fits.
+//
+// What a dynamic table size update (§ 6.3) does.  A resize to zero
+// empties the table, which is how an encoder tells a decoder to forget
+// everything — the thing a proxy does when it starts relaying for a
+// different origin.
+//
+// ```novo
+// use h2hpack
+//
+// fn main() [io]
+//     println("${h2hpack.table_resize(h2hpack.table(4096), 0).max_size}")
+// ```
+pub fn table_resize(t: H2Table, max_size: Int) -> H2Table []
+    todo("http2-nv.h2hpack.table_resize")
+
+// The entry at an ABSOLUTE index — static first, then dynamic — or
+// `None`.
+//
+// One address space, which is what the wire has: index 62 is the
+// newest dynamic entry, 63 the one before it.  A package that published
+// two lookups would leave every caller writing the same subtraction,
+// and getting it wrong by one is a header that decodes to its
+// neighbour.
+//
+// ```novo
+// use h2hpack
+//
+// fn main() [io]
+//     match h2hpack.table_at(h2hpack.table(4096), 2)
+//         Some(e) => println(e.name)
+//         None    => println("no such index")
+// ```
+pub fn table_at(t: H2Table, index: Int) -> ?H2Entry []
+    todo("http2-nv.h2hpack.table_at")
+
+// How many entries the dynamic table holds.
+//
+// ```novo
+// use h2hpack
+//
+// fn main() [io]
+//     println("${h2hpack.table_len(h2hpack.table(4096))}")
+// ```
+pub fn table_len(t: H2Table) -> Int []
+    todo("http2-nv.h2hpack.table_len")
+
+// The absolute index of this name and value in this table, or 0.
+//
+// Static first so an encoder prefers the index both peers had before
+// the connection opened.
+//
+// ```novo
+// use h2hpack
+//
+// fn main() [io]
+//     println("${h2hpack.table_index_of(h2hpack.table(4096), ":scheme", "https")}")
+// ```
+pub fn table_index_of(t: H2Table, name: Str, value: Str) -> Int []
+    todo("http2-nv.h2hpack.table_index_of")
+
+// An integer in HPACK's prefix encoding, § 5.1, appended to a buffer.
+//
+// `prefix_bits` is how many of the first byte's low bits the integer
+// gets — 7 for an indexed field, 6 for an incremental literal, 4 for
+// the others, 5 for a table size update — and `prefix_value` is what
+// the high bits carry.  The two are separate arguments because the
+// caller knows both and the encoding cannot be written without either.
+//
+// ```novo
+// use std.list
+// use h2hpack
+//
+// fn main() [io]
+//     println("${list.len(h2hpack.integer_into(1337, 5, 0x20, []))}")
+// ```
+pub fn integer_into(value: Int, prefix_bits: Int, prefix_value: Int, out: [u8]) -> [u8] []
+    todo("http2-nv.h2hpack.integer_into")
+
+// An integer in HPACK's prefix encoding, read from a buffer.
+//
+// Refuses a continuation sequence that would overflow rather than
+// wrapping: § 5.1 allows an encoder to write an arbitrarily long
+// integer, so a peer can send eight bytes of continuation and mean 2^56
+// unless the decoder says no.  That refusal is the whole reason this is
+// a `Result`.
+//
+// ```novo
+// use h2hpack
+//
+// fn main() [io]
+//     match h2hpack.integer_of_bytes([0x1F as u8, 0x9A as u8, 0x0A as u8], 0, 5)
+//         Ok(v)  => println("${v.value} ${v.next}")
+//         Err(e) => println(e.message())
+// ```
+pub @tier(embedded)
+fn integer_of_bytes(src: [u8], at: Int, prefix_bits: Int) -> Result<H2VarInt, H2DecodeError> []
+    todo("http2-nv.h2hpack.integer_of_bytes")
+
+// A length-prefixed string, appended to a buffer, Huffman-coded or not
+// as the caller says.
+//
+// ```novo
+// use std.list
+// use h2hpack
+//
+// fn main() [io]
+//     println("${list.len(h2hpack.string_into("/index.html", true, []))}")
+// ```
+pub fn string_into(s: Str, huffman: Bool, out: [u8]) -> [u8] []
+    todo("http2-nv.h2hpack.string_into")
+
+// A length-prefixed string, read from a buffer, Huffman-decoded when
+// the high bit of the length byte says so.
+//
+// ```novo
+// use h2hpack
+//
+// fn main() [io]
+//     match h2hpack.string_of_bytes([0x01 as u8, 0x61 as u8], 0)
+//         Ok(s)  => println(s.text)
+//         Err(e) => println(e.message())
+// ```
+pub fn string_of_bytes(src: [u8], at: Int) -> Result<H2VarStr, H2DecodeError> []
+    todo("http2-nv.h2hpack.string_of_bytes")
+
+// The 257 Huffman codes of RFC 7541 appendix B, right-aligned in an
+// `Int` each, in symbol order.
+//
+// Data rather than a generated tree, and published rather than private,
+// for the reason the static table is: it is normative, a wrong entry
+// corrupts one character in one header, and a test compares it against
+// the appendix.  Symbol 256 is the end-of-string code, which never
+// appears in an encoding and whose presence in a decode is an error.
+//
+// ```novo
+// use std.list
+// use h2hpack
+//
+// fn main() [io]
+//     println("${list.len(h2hpack.huffman_codes())}")
+// ```
+pub fn huffman_codes() -> [Int] []
+    todo("http2-nv.h2hpack.huffman_codes")
+
+// How many bits each of the 257 codes is, in symbol order.
+//
+// A second list rather than a struct per symbol, because the pair is
+// read in the innermost loop of every encode and a list of structs
+// costs an indirection per character on a device.
+//
+// ```novo
+// use std.list
+// use h2hpack
+//
+// fn main() [io]
+//     println("${list.len(h2hpack.huffman_lengths())}")
+// ```
+pub fn huffman_lengths() -> [Int] []
+    todo("http2-nv.h2hpack.huffman_lengths")
+
+// How many bytes this string would be Huffman-coded, rounded up with
+// the padding.
+//
+// ```novo
+// use h2hpack
+//
+// fn main() [io]
+//     println("${h2hpack.huffman_encoded_len("www.example.com")}")
+// ```
+pub @tier(embedded)
+fn huffman_encoded_len(s: Str) -> Int []
+    todo("http2-nv.h2hpack.huffman_encoded_len")
+
+// Is the Huffman coding of this string SHORTER than the string?
+//
+// § 5.2's rule, published as a predicate because the answer is no for
+// exactly the values a naive encoder inflates: base64, a UUID, a long
+// path in a non-Latin script.
+//
+// ```novo
+// use h2hpack
+//
+// fn main() [io]
+//     println("${h2hpack.huffman_shorter("www.example.com")}")
+// ```
+pub @tier(embedded)
+fn huffman_shorter(s: Str) -> Bool []
+    todo("http2-nv.h2hpack.huffman_shorter")
+
+// This string Huffman-coded, appended to a buffer, padded to a byte
+// boundary with ones.
+//
+// ```novo
+// use std.list
+// use h2hpack
+//
+// fn main() [io]
+//     println("${list.len(h2hpack.huffman_into("www.example.com", []))}")
+// ```
+pub fn huffman_into(s: Str, out: [u8]) -> [u8] []
+    todo("http2-nv.h2hpack.huffman_into")
+
+// `len` Huffman-coded bytes from `at`, decoded.
+//
+// Refuses padding that is not all ones, padding longer than seven bits,
+// and the end-of-string symbol — § 5.2 makes each of them a decoding
+// error, and tolerating them is how two implementations come to
+// disagree about what a header said.
+//
+// ```novo
+// use h2hpack
+//
+// fn main() [io]
+//     match h2hpack.huffman_of_bytes([0xF1 as u8], 0, 1)
+//         Ok(s)  => println(s)
+//         Err(e) => println(e.message())
+// ```
+pub fn huffman_of_bytes(src: [u8], at: Int, len: Int) -> Result<Str, H2DecodeError> []
+    todo("http2-nv.h2hpack.huffman_of_bytes")
+
+// A header with the ordinary indexing decision.
+//
+// ```novo
+// use h2hpack
+//
+// fn main() [io]
+//     println(h2hpack.header("content-type", "application/grpc").name)
+// ```
+pub fn header(name: Str, value: Str) -> H2Header []
+    todo("http2-nv.h2hpack.header")
+
+// A header that must never enter a compression table, here or in any
+// intermediary.
+//
+// What `authorization`, `cookie` and anything else carrying a
+// credential gets.
+//
+// ```novo
+// use h2hpack
+//
+// fn main() [io]
+//     println("${h2hpack.header_never_indexed("authorization", "Bearer x").never_indexed}")
+// ```
+pub fn header_never_indexed(name: Str, value: Str) -> H2Header []
+    todo("http2-nv.h2hpack.header_never_indexed")
+
+// Which representation this header asks for.
+//
+// ```novo
+// use h2hpack
+//
+// fn main() [io]
+//     match h2hpack.indexing_of(h2hpack.header_never_indexed("authorization", "Bearer x"))
+//         H2IndexNever => println("never")
+//         _            => println("indexable")
+// ```
+pub fn indexing_of(h: H2Header) -> H2Indexing []
+    todo("http2-nv.h2hpack.indexing_of")
+
+// Is this a pseudo-header — a name beginning with `:`?
+//
+// ```novo
+// use h2hpack
+//
+// fn main() [io]
+//     println("${h2hpack.is_pseudo(":method")}")
+// ```
+pub @tier(embedded)
+fn is_pseudo(name: Str) -> Bool []
+    todo("http2-nv.h2hpack.is_pseudo")
+
+// Is this name legal in an HTTP/2 header list, § 8.2.1?
+//
+// Lowercase only, non-empty, and not one of the connection-specific
+// names HTTP/2 forbids: `connection`, `keep-alive`, `proxy-connection`,
+// `transfer-encoding`, `upgrade`.  `te` is legal only with the value
+// `trailers`, which is why the value check is separate.
+//
+// ```novo
+// use h2hpack
+//
+// fn main() [io]
+//     println("${h2hpack.name_ok("Content-Type")}")
+// ```
+pub fn name_ok(name: Str) -> Bool []
+    todo("http2-nv.h2hpack.name_ok")
+
+// Is this value legal — no NUL, no CR, no LF, no leading or trailing
+// space?
+//
+// The response-splitting check.  It is a function rather than a rule in
+// the encoder's prose because a proxy validates a value it received
+// before it re-emits it, and that call site is not an encode.
+//
+// ```novo
+// use h2hpack
+//
+// fn main() [io]
+//     println("${h2hpack.value_ok("application/grpc")}")
+// ```
+pub fn value_ok(value: Str) -> Bool []
+    todo("http2-nv.h2hpack.value_ok")
+
+// The first header in this list that breaks § 8.3's ordering — a
+// pseudo-header after a regular one — or `None`.
+//
+// A name rather than an index, because the message a host writes names
+// the header and an index means nothing to the peer that sent it.
+//
+// ```novo
+// use h2hpack
+//
+// fn main() [io]
+//     match h2hpack.pseudo_order_fault([])
+//         Some(n) => println(n)
+//         None    => println("in order")
+// ```
+pub fn pseudo_order_fault(hs: [H2Header]) -> ?Str []
+    todo("http2-nv.h2hpack.pseudo_order_fault")
+
+// What this list counts as against SETTINGS_MAX_HEADER_LIST_SIZE: the
+// sum of name length, value length and 32 per entry, § 6.5.2.
+//
+// The 32 is in the LIST size as well as the table size, and it is the
+// reason the limit is not simply "the bytes": a peer that measured only
+// the bytes would accept ten thousand empty headers.
+//
+// ```novo
+// use h2hpack
+//
+// fn main() [io]
+//     println("${h2hpack.list_size([])}")
+// ```
+pub fn list_size(hs: [H2Header]) -> Int []
+    todo("http2-nv.h2hpack.list_size")
+
+// A header block written into a caller's buffer, with the table the
+// encode left behind.
+//
+// The table must be threaded: an incrementally-indexed header changed
+// it, and a caller that kept the old one desynchronises from its peer
+// on the very next block.
+//
+// ```novo
+// use std.list
+// use h2hpack
+//
+// fn main() [io]
+//     match h2hpack.encode_into(h2hpack.table(4096), [], [])
+//         Ok(w)  => println("${list.len(w.out)}")
+//         Err(e) => println(e.message())
+// ```
+pub fn encode_into(t: H2Table, hs: [H2Header], out: [u8]) -> Result<H2Encoded, H2EncodeError> []
+    todo("http2-nv.h2hpack.encode_into")
+
+// A whole header block decoded, with the table the decode left behind.
+//
+// A WHOLE block: this is never called with a fragment, because a
+// decoder that stopped in the middle of one cannot be resumed and
+// cannot be abandoned — the table would be wrong either way.  `h2conn`
+// joins CONTINUATION frames before it calls this, and refuses a block
+// that grows past its limit before decoding rather than during.
+//
+// `max_list` is the LOCAL SETTINGS_MAX_HEADER_LIST_SIZE.  A list over
+// it is still decoded to completion — the table must be updated — and
+// then refused, which is the ordering § 4.2 requires and the one a
+// straightforward implementation gets backwards.
+//
+// ```novo
+// use std.list
+// use h2hpack
+//
+// fn main() [io]
+//     match h2hpack.decode(h2hpack.table(4096), [0x82 as u8], 8192)
+//         Ok(d)  => println("${list.len(d.headers)}")
+//         Err(e) => println(e.message())
+// ```
+pub fn decode(t: H2Table, block: [u8], max_list: Int) -> Result<H2Decoded, H2DecodeError> []
+    todo("http2-nv.h2hpack.decode")
+
+// A dynamic table size update, § 6.3, appended to a buffer.
+//
+// Its own function because it is not a header and must come FIRST in a
+// block — an encoder that emitted one after a header would produce a
+// block the peer refuses with COMPRESSION_ERROR.
+//
+// ```novo
+// use std.list
+// use h2hpack
+//
+// fn main() [io]
+//     println("${list.len(h2hpack.table_update_into(4096, []))}")
+// ```
+pub fn table_update_into(max_size: Int, out: [u8]) -> [u8] []
+    todo("http2-nv.h2hpack.table_update_into")

@@ -1,0 +1,388 @@
+// h2stream.nv — the seven states a stream can be in, and the only
+// transitions between them.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE STATE MACHINE IS RFC 9113 § 5.1 AND NOTHING ELSE.  Seven states,
+// and a transition happens when a frame is SENT or RECEIVED — which is
+// the part that makes the machine asymmetric and the part a first
+// implementation collapses.  `half-closed (local)` means THIS endpoint
+// has finished sending and may still receive; `half-closed (remote)` is
+// the mirror.  An implementation with one `HalfClosed` state cannot tell
+// "I am done talking" from "they are done talking", and the two have
+// opposite consequences for every subsequent frame.
+//
+// A STREAM ERROR IS NOT A CONNECTION ERROR.  Every fault this module
+// raises is one stream's — the connection carries on and the peer gets
+// a RST_STREAM — except the identifier rules, which are the
+// connection's because a reused or wrong-parity identifier means the
+// two endpoints no longer agree about what a number refers to.
+// `fault_is_connection` is where that split is written down.
+//
+// A CLOSED STREAM STILL RECEIVES FRAMES, AND THAT IS NORMAL.  § 5.1
+// spends a paragraph on it: after RST_STREAM there is a flight of
+// frames already on the wire that the peer sent before it heard, and an
+// endpoint must tolerate them for a while rather than answering each one
+// with another RST_STREAM — which is how two implementations reset each
+// other in a loop until one of them gives up.  `tolerates_after_close`
+// is that rule as a predicate, and `local_reset` is the flag it reads.
+//
+// IDENTIFIERS ONLY GO UP, AND PARITY SAYS WHO OPENED IT.  § 5.1.1:
+// clients use odd numbers, servers even, and a stream identifier is
+// never reused on a connection — not after a reset, not after a
+// close.  A server that saw stream 7 and then stream 5 has a client
+// that is confused or hostile, and either way the connection is over.
+//
+// NOTHING HERE PERFORMS ANYTHING.  Every row in this module is `[]`.
+
+use h2err
+
+// Where a stream is, § 5.1.
+pub enum H2StreamState
+    // Nothing has happened on this identifier yet.  Every identifier
+    // below the highest one seen is implicitly closed rather than idle,
+    // which is what lets a peer skip numbers.
+    H2StIdle
+    // This endpoint promised it with a PUSH_PROMISE and has not sent
+    // the response head yet.
+    H2StReservedLocal
+    // The peer promised it and has not sent the response head yet.
+    H2StReservedRemote
+    // Both directions are live.
+    H2StOpen
+    // THIS endpoint has sent END_STREAM.  It may still receive, and it
+    // may send WINDOW_UPDATE, PRIORITY and RST_STREAM and nothing else.
+    H2StHalfClosedLocal
+    // The PEER has sent END_STREAM.  This endpoint may still send.
+    H2StHalfClosedRemote
+    // Over, in both directions.
+    H2StClosed
+
+// A thing that happens to a stream, from one side.
+//
+// Send and receive are separate variants of one enum rather than a
+// direction argument, because half the transitions differ between them
+// and a machine that took a direction flag would be a machine with the
+// flag consulted in eleven places.
+pub enum H2Move
+    // A HEADERS frame written.  `end_stream` is END_STREAM on it — a
+    // trailers-only response, or a GET with no body, sets it on the
+    // first HEADERS the stream ever sees.
+    H2MoveSendHeaders(end_stream: Bool)
+    // A HEADERS frame read.
+    H2MoveRecvHeaders(end_stream: Bool)
+    // A DATA frame written.
+    H2MoveSendData(end_stream: Bool)
+    // A DATA frame read.
+    H2MoveRecvData(end_stream: Bool)
+    // A RST_STREAM written.  Closes the stream immediately from this
+    // side and sets the tolerance window for frames still in flight.
+    H2MoveSendReset
+    // A RST_STREAM read.  Closes the stream immediately.
+    H2MoveRecvReset
+    // A PUSH_PROMISE written — reserves the promised stream, not this
+    // one.  Applied to the PROMISED identifier.
+    H2MoveSendPush
+    // A PUSH_PROMISE read.
+    H2MoveRecvPush
+    // A GOAWAY arrived whose `last_stream` is below this stream's
+    // identifier, so this stream was never processed.  Closes it, and
+    // is the transition that makes a retry safe.
+    H2MoveGoAwayAbove
+
+// One stream: what it is called, where it is, and the two windows
+// that travel with it.
+//
+// The windows are on the stream rather than in a table beside it,
+// because every decision about a DATA frame consults the state and the
+// window together and two structures that can disagree about which
+// streams exist is a class of bug this avoids by construction.
+pub struct H2Stream
+    id: Int
+    state: H2StreamState
+    // What this endpoint may still send on this stream.
+    send: H2Window
+    // What the peer may still send on this stream.
+    recv: H2Window
+    // This endpoint sent a RST_STREAM, so frames still in flight are
+    // tolerated rather than answered.
+    local_reset: Bool
+
+// Why a move could not be made.
+//
+// `state_name` and `move_name` are text rather than the values,
+// because the fault travels into a log and an `H2StreamState` in a
+// message is a formatter every consumer would have to write.
+pub enum H2StreamFault
+    // The state does not admit this move: DATA on an idle stream,
+    // HEADERS after END_STREAM, anything at all on a closed one.
+    H2StreamWrongState(id: Int, state_name: Str, move_name: Str)
+    // An identifier at or below the highest one already seen from this
+    // peer.  § 5.1.1 — a connection error, because the two endpoints no
+    // longer agree what a number means.
+    H2StreamIdReused(id: Int, highest: Int)
+    // A client used an even identifier or a server an odd one.
+    H2StreamIdWrongParity(id: Int, from_client: Bool)
+    // One more concurrent stream than SETTINGS_MAX_CONCURRENT_STREAMS
+    // allows.  A stream error with REFUSED_STREAM, which is the code
+    // that tells the peer it is safe to try again elsewhere.
+    H2StreamLimitReached(limit: Int)
+    // A PUSH_PROMISE arrived after this endpoint announced
+    // SETTINGS_ENABLE_PUSH of 0.
+    H2StreamPushRefused(id: Int)
+
+// The standard `Error` implementation, so a stream fault can be
+// reported by anything that reports errors.
+impl Error for H2StreamFault
+    // One line: which stream, what state it was in, and what was
+    // attempted.
+    fn message(self) -> Str
+        todo("http2-nv.h2stream.H2StreamFault.message")
+
+// A new stream in `H2StIdle`, with both windows at the initial sizes
+// the two peers announced.
+//
+// Two initial sizes because they are two different SETTINGS values:
+// `initial_send` is the peer's SETTINGS_INITIAL_WINDOW_SIZE and
+// `initial_recv` is this endpoint's own.  A constructor that took one
+// would be right only on a connection where both peers chose the same
+// number.
+//
+// ```novo
+// use h2stream
+//
+// fn main() [io]
+//     println("${h2stream.stream(1, 65535, 65535).id}")
+// ```
+pub fn stream(id: Int, initial_send: Int, initial_recv: Int) -> H2Stream []
+    todo("http2-nv.h2stream.stream")
+
+// The specification's own spelling — `"half-closed (local)"`.
+//
+// ```novo
+// use h2stream
+//
+// fn main() [io]
+//     println(h2stream.state_name(H2StHalfClosedLocal))
+// ```
+pub fn state_name(s: H2StreamState) -> Str []
+    todo("http2-nv.h2stream.state_name")
+
+// The move's own name, for a fault message — `"send HEADERS"`.
+//
+// ```novo
+// use h2stream
+//
+// fn main() [io]
+//     println(h2stream.move_name(H2MoveSendData(true)))
+// ```
+pub fn move_name(m: H2Move) -> Str []
+    todo("http2-nv.h2stream.move_name")
+
+// The state a move leads to, or the fault it is.
+//
+// The whole of § 5.1 as one function, with no stream and no windows in
+// it — so the transition table can be tested exhaustively: seven states
+// times nine moves is sixty-three answers, and a test that walks all of
+// them is worth more than any number of tests that drive a connection.
+//
+// ```novo
+// use h2stream
+//
+// fn main() [io]
+//     match h2stream.state_after(H2StOpen, H2MoveSendData(true))
+//         Ok(s)  => println(h2stream.state_name(s))
+//         Err(e) => println(e.message())
+// ```
+pub fn state_after(s: H2StreamState, m: H2Move) -> Result<H2StreamState, H2StreamFault> []
+    todo("http2-nv.h2stream.state_after")
+
+// The stream after a move: the new state, and `local_reset` set when
+// the move was a reset this endpoint sent.
+//
+// ```novo
+// use h2stream
+//
+// fn main() [io]
+//     match h2stream.advance(h2stream.stream(1, 65535, 65535), H2MoveSendHeaders(false))
+//         Ok(s)  => println(h2stream.state_name(s.state))
+//         Err(e) => println(e.message())
+// ```
+pub fn advance(s: H2Stream, m: H2Move) -> Result<H2Stream, H2StreamFault> []
+    todo("http2-nv.h2stream.advance")
+
+// May this endpoint send a frame of this kind on a stream in this
+// state?
+//
+// WINDOW_UPDATE, PRIORITY and RST_STREAM are the three that a
+// half-closed stream still admits, and they are the three a
+// straightforward reading of the state diagram refuses.
+//
+// ```novo
+// use h2frame
+// use h2stream
+//
+// fn main() [io]
+//     println("${h2stream.may_send(H2StHalfClosedLocal, H2KindWindowUpdate)}")
+// ```
+pub fn may_send(s: H2StreamState, k: H2FrameKind) -> Bool []
+    todo("http2-nv.h2stream.may_send")
+
+// May the peer send a frame of this kind on a stream in this state?
+//
+// Not the mirror of `may_send`: a stream this endpoint half-closed
+// locally still receives DATA, and one the peer half-closed does not.
+//
+// ```novo
+// use h2frame
+// use h2stream
+//
+// fn main() [io]
+//     println("${h2stream.may_receive(H2StHalfClosedRemote, H2KindData)}")
+// ```
+pub fn may_receive(s: H2StreamState, k: H2FrameKind) -> Bool []
+    todo("http2-nv.h2stream.may_receive")
+
+// Should a frame of this kind on a closed stream be TOLERATED rather
+// than answered with a RST_STREAM?
+//
+// § 5.1's flight-in-progress rule: after this endpoint sent a
+// RST_STREAM, the peer's frames that were already on the wire are not
+// its fault, and answering each one with another RST_STREAM is how two
+// implementations reset each other until one gives up.  `local_reset`
+// is the flag; a stream that closed normally tolerates less.
+//
+// ```novo
+// use h2frame
+// use h2stream
+//
+// fn main() [io]
+//     println("${h2stream.tolerates_after_close(true, H2KindData)}")
+// ```
+pub fn tolerates_after_close(local_reset: Bool, k: H2FrameKind) -> Bool []
+    todo("http2-nv.h2stream.tolerates_after_close")
+
+// Is this stream over?
+//
+// ```novo
+// use h2stream
+//
+// fn main() [io]
+//     println("${h2stream.is_closed(H2StClosed)}")
+// ```
+pub fn is_closed(s: H2StreamState) -> Bool []
+    todo("http2-nv.h2stream.is_closed")
+
+// Has this endpoint finished SENDING on a stream in this state?
+//
+// True for `half-closed (local)` and `closed`.  Published because the
+// question "may I still write" is asked far more often than the state
+// itself, and a caller comparing against two variants gets it wrong the
+// first time.
+//
+// ```novo
+// use h2stream
+//
+// fn main() [io]
+//     println("${h2stream.send_finished(H2StHalfClosedLocal)}")
+// ```
+pub fn send_finished(s: H2StreamState) -> Bool []
+    todo("http2-nv.h2stream.send_finished")
+
+// Has the PEER finished sending on a stream in this state?
+//
+// ```novo
+// use h2stream
+//
+// fn main() [io]
+//     println("${h2stream.recv_finished(H2StHalfClosedRemote)}")
+// ```
+pub fn recv_finished(s: H2StreamState) -> Bool []
+    todo("http2-nv.h2stream.recv_finished")
+
+// Did a client open this identifier — is it odd, § 5.1.1?
+//
+// ```novo
+// use h2stream
+//
+// fn main() [io]
+//     println("${h2stream.is_client_initiated(3)}")
+// ```
+pub fn is_client_initiated(id: Int) -> Bool []
+    todo("http2-nv.h2stream.is_client_initiated")
+
+// The next identifier a client may open after `last`, or 0 when the
+// space is exhausted.
+//
+// 0 rather than a wrap, because § 5.1.1 says an endpoint that has run
+// out opens a NEW CONNECTION — and an identifier space that wrapped
+// would silently reuse numbers, which is the one thing the section
+// forbids outright.
+//
+// ```novo
+// use h2stream
+//
+// fn main() [io]
+//     println("${h2stream.next_client_id(3)}")
+// ```
+pub fn next_client_id(last: Int) -> Int []
+    todo("http2-nv.h2stream.next_client_id")
+
+// The next identifier a server may open for a push after `last`, or 0.
+//
+// ```novo
+// use h2stream
+//
+// fn main() [io]
+//     println("${h2stream.next_server_id(2)}")
+// ```
+pub fn next_server_id(last: Int) -> Int []
+    todo("http2-nv.h2stream.next_server_id")
+
+// Is this a legal NEW identifier from this peer, given the highest one
+// already seen from it?
+//
+// Strictly greater, and the right parity.  Both halves are § 5.1.1 and
+// both are connection errors, which is why they are one question.
+//
+// ```novo
+// use h2stream
+//
+// fn main() [io]
+//     println("${h2stream.new_id_ok(5, true, 3)}")
+// ```
+pub fn new_id_ok(id: Int, from_client: Bool, highest: Int) -> Bool []
+    todo("http2-nv.h2stream.new_id_ok")
+
+// Is this fault the connection's rather than one stream's?
+//
+// The identifier rules are the connection's; a wrong state, a refused
+// push and a concurrency limit are one stream's.  The same split
+// `h2err.is_connection_fault` makes for decode faults, asked of the
+// other fault type — and the two must agree, which is what a test
+// asserts.
+//
+// ```novo
+// use h2stream
+//
+// fn main() [io]
+//     println("${h2stream.fault_is_connection(H2StreamIdReused(3, 5))}")
+// ```
+pub fn fault_is_connection(f: H2StreamFault) -> Bool []
+    todo("http2-nv.h2stream.fault_is_connection")
+
+// The error code this fault is answered with.
+//
+// REFUSED_STREAM for the concurrency limit — the one code that tells a
+// peer its request was never processed, so a non-idempotent retry is
+// safe — and PROTOCOL_ERROR or STREAM_CLOSED for the rest.
+//
+// ```novo
+// use h2err
+// use h2stream
+//
+// fn main() [io]
+//     println(h2err.error_code_name(h2stream.fault_code(H2StreamLimitReached(100))))
+// ```
+pub fn fault_code(f: H2StreamFault) -> H2ErrorCode []
+    todo("http2-nv.h2stream.fault_code")

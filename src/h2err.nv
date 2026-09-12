@@ -1,0 +1,319 @@
+// h2err.nv — the error codes the protocol carries, and the two faults
+// this package raises: one for bytes that arrived wrong and one for a
+// value a caller asked to write that cannot be written.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE ONE DISTINCTION THAT DECIDES EVERY RECOVERY.  RFC 9113 § 5.4
+// splits every fault in HTTP/2 into two kinds, and an implementation
+// that blurs them is broken in both directions.  A CONNECTION error
+// ends every stream on the connection with a GOAWAY, because the
+// connection's shared state — the HPACK dynamic table, the frame
+// framing, the connection window — is no longer trustworthy and no
+// stream on it can be believed.  A STREAM error ends ONE stream with a
+// RST_STREAM and the connection carries on.  Tear down a connection for
+// a stream error and a client loses ninety-nine calls because the
+// hundredth had a bad header; recover a connection error as a stream
+// error and the HPACK table stays desynchronised, so every header on
+// every later stream decodes to something the sender never wrote.
+//
+// SO THE CLASSIFICATION IS PUBLISHED AS A FUNCTION, not left to a
+// reader of the specification: `is_connection_fault` answers it for
+// every variant of `H2DecodeError`, and `code_for` answers which error
+// code the peer is owed.  A host that consults those two has the § 5.4
+// behaviour without having read § 5.4.
+//
+// AN UNKNOWN ERROR CODE IS KEPT, NOT FLATTENED.  § 7 says an unknown
+// code is treated as INTERNAL_ERROR, and it also says the number must
+// survive: a proxy relaying a GOAWAY it does not understand has to
+// relay the number it received, and an operator reading a log wants the
+// code the peer actually sent rather than the one this package would
+// have chosen.  `H2ErrUnknown` carries it.
+//
+// NOTHING HERE PERFORMS ANYTHING.  Every row in this module is `[]`.
+
+// An HTTP/2 error code, RFC 9113 § 7.
+//
+// The thirteen the specification names, plus the number for anything
+// else.  They travel in RST_STREAM and in GOAWAY and nowhere else,
+// which is why they are one type rather than two.
+pub enum H2ErrorCode
+    // 0x00 — the stream or connection finished with nothing wrong.  A
+    // GOAWAY carrying it is a graceful shutdown, which is the only
+    // polite way to close an HTTP/2 connection.
+    H2ErrNoError
+    // 0x01 — an unspecified protocol violation.  The code to reach for
+    // only when none of the others fits.
+    H2ErrProtocol
+    // 0x02 — the implementation failed, and it is not the peer's fault.
+    H2ErrInternal
+    // 0x03 — a flow-control window was exceeded or overflowed.
+    H2ErrFlowControl
+    // 0x04 — a SETTINGS frame went unacknowledged for too long.  The
+    // "too long" is the host's, because a `core` package has no clock.
+    H2ErrSettingsTimeout
+    // 0x05 — a frame arrived on a stream that is closed.
+    H2ErrStreamClosed
+    // 0x06 — the frame's length is wrong for its type.
+    H2ErrFrameSize
+    // 0x07 — the stream was refused before any processing happened.
+    // THE ONE CODE THAT MAKES A RETRY SAFE for a request that is not
+    // idempotent, which is why grpc-nv's `never_processed` names it.
+    H2ErrRefusedStream
+    // 0x08 — the stream is no longer needed.  What a cancelled request
+    // and an expired deadline both end with.
+    H2ErrCancel
+    // 0x09 — the HPACK context could not be maintained.  ALWAYS a
+    // connection error: the dynamic table is shared, so a decoder that
+    // lost its place cannot read any later block on the connection.
+    H2ErrCompression
+    // 0x0a — the connection established in response to CONNECT was
+    // reset or abnormally closed.
+    H2ErrConnect
+    // 0x0b — the peer is generating excessive load.
+    H2ErrEnhanceYourCalm
+    // 0x0c — the transport properties do not meet the minimum the peer
+    // requires: a TLS version, a cipher suite.
+    H2ErrInadequateSecurity
+    // 0x0d — the endpoint requires HTTP/1.1 for this request.
+    H2ErrHttp11Required
+    // Anything else, with the number the peer sent.  § 7 says to treat
+    // it as INTERNAL_ERROR and says nothing about discarding it, and a
+    // proxy relaying a GOAWAY has to relay what it received.
+    H2ErrUnknown(code: Int)
+
+// The code as the number that goes on the wire.
+//
+// ```novo
+// use h2err
+//
+// fn main() [io]
+//     println("${h2err.error_code_num(H2ErrRefusedStream)}")
+// ```
+pub @tier(embedded)
+fn error_code_num(c: H2ErrorCode) -> Int []
+    todo("http2-nv.h2err.error_code_num")
+
+// The code a number on the wire means.
+//
+// Never fails: an unrecognised number becomes `H2ErrUnknown` with the
+// number kept, because § 7 requires an unknown code to be tolerated
+// rather than treated as a framing fault.
+//
+// ```novo
+// use h2err
+//
+// fn main() [io]
+//     println(h2err.error_code_name(h2err.error_code_of_num(0x07)))
+// ```
+pub @tier(embedded)
+fn error_code_of_num(n: Int) -> H2ErrorCode []
+    todo("http2-nv.h2err.error_code_of_num")
+
+// The specification's own spelling — `"REFUSED_STREAM"`,
+// `"FLOW_CONTROL_ERROR"`, and `"UNKNOWN(0x20)"` for a code this
+// package does not name.
+//
+// The specification's spelling rather than a prose phrase, because the
+// number in a log has to be searchable against the RFC a reader has
+// open beside it.
+//
+// ```novo
+// use h2err
+//
+// fn main() [io]
+//     println(h2err.error_code_name(H2ErrFlowControl))
+// ```
+pub fn error_code_name(c: H2ErrorCode) -> Str []
+    todo("http2-nv.h2err.error_code_name")
+
+// The code an unknown one is HANDLED as, § 7.
+//
+// `H2ErrInternal` for anything this package does not name, and the code
+// itself otherwise.  Separate from `error_code_of_num` because the two
+// answer different questions: one is "what did the peer send", which a
+// relay needs, and this is "what do I do about it", which a state
+// machine needs.
+//
+// ```novo
+// use h2err
+//
+// fn main() [io]
+//     println(h2err.error_code_name(h2err.effective_code(H2ErrUnknown(0x20))))
+// ```
+pub fn effective_code(c: H2ErrorCode) -> H2ErrorCode []
+    todo("http2-nv.h2err.effective_code")
+
+// Why bytes that arrived could not be read.
+//
+// EVERY VARIANT NAMES WHERE, because a decoder fault on a connection
+// carrying a hundred streams is unactionable without the stream
+// identifier and the offset.  A host logging one of these can point at
+// the frame.
+pub enum H2DecodeError
+    // The client's connection preface was not the twenty-four bytes it
+    // has to be.  `at` is the first byte that disagreed.
+    H2BadPreface(at: Int)
+    // A frame's length field exceeds the peer's SETTINGS_MAX_FRAME_SIZE.
+    H2FrameTooLarge(length: Int, max: Int)
+    // The length is wrong for the frame type: a RST_STREAM that is not
+    // four bytes, a PING that is not eight, a SETTINGS that is not a
+    // multiple of six.
+    H2BadFrameSize(kind: Int, length: Int)
+    // A frame that must name a stream arrived on stream 0, or one that
+    // must be connection-scoped arrived on a stream.  § 4.1 makes both
+    // a connection error and the symptom is identical from either side.
+    H2StreamIdForbidden(kind: Int, stream: Int)
+    // The padding length byte is at least the frame's remaining length,
+    // so the padding would consume the payload.
+    H2BadPadding(length: Int, padding: Int)
+    // A frame that is not CONTINUATION arrived while a header block was
+    // still open, or a CONTINUATION arrived when none was.  Interleaving
+    // anything into a header block is a connection error because the
+    // HPACK state cannot be reconstructed either way.
+    H2ContinuationBroken(stream: Int, kind: Int)
+    // The CONTINUATION frames for one header block went past the
+    // caller's limit.  Not in the RFC as a numbered rule, and in every
+    // implementation that survived the 2024 CONTINUATION flood.
+    H2ContinuationFlood(bytes: Int, max: Int)
+    // An HPACK index names neither a static nor a dynamic entry.
+    H2HpackBadIndex(index: Int, at: Int)
+    // An HPACK integer's continuation bytes never ended, or the value
+    // overflowed.  A prefix integer is allowed to be arbitrarily long
+    // on the wire and is not allowed to be arbitrarily long in memory.
+    H2HpackBadInteger(at: Int)
+    // A Huffman-coded string contained a code that is not in the table,
+    // or ended on padding that is not all ones — § 5.2 makes both
+    // decoding errors rather than something to be lenient about.
+    H2HpackBadHuffman(at: Int)
+    // A dynamic table size update asked for more than the peer's
+    // SETTINGS_HEADER_TABLE_SIZE allows.
+    H2HpackTableTooLarge(asked: Int, max: Int)
+    // The decoded header list exceeded SETTINGS_MAX_HEADER_LIST_SIZE.
+    // Reported after the block has been decoded rather than before,
+    // because the HPACK table must be updated even for a list that is
+    // then refused — a decoder that stops early desynchronises.
+    H2HeaderListTooLarge(bytes: Int, max: Int)
+    // A header name has an uppercase letter, a header name is empty, or
+    // a connection-specific header was present.  § 8.2.1 makes each of
+    // them malformed, and the caller is told which name.
+    H2BadHeaderName(name: Str)
+    // A pseudo-header appeared after a regular header, twice, or one
+    // the request/response form does not allow.
+    H2BadPseudoHeader(name: Str)
+    // A SETTINGS value is outside the range the specification allows —
+    // ENABLE_PUSH that is not 0 or 1, an INITIAL_WINDOW_SIZE above
+    // 2^31-1, a MAX_FRAME_SIZE outside 16384..16777215.
+    H2BadSettingValue(id: Int, value: Int)
+    // A frame arrived that the stream's state does not admit.
+    H2WrongStreamState(stream: Int, state_name: Str, kind: Int)
+    // A flow-control window was exceeded, overflowed, or a
+    // WINDOW_UPDATE carried an increment of zero.
+    H2FlowViolation(stream: Int, detail: Str)
+    // A stream identifier reused a number already seen, or used the
+    // wrong parity for the peer that opened it.
+    H2BadStreamId(stream: Int, highest: Int)
+    // More concurrent streams than SETTINGS_MAX_CONCURRENT_STREAMS.
+    H2TooManyStreams(limit: Int)
+
+// The standard `Error` implementation, so a decode fault can be
+// reported by anything that reports errors.
+impl Error for H2DecodeError
+    // One line: what was wrong, on which stream, and at which byte.
+    //
+    // The stream identifier is in the message rather than left to the
+    // caller to add, because a connection carrying a hundred streams
+    // has no other landmark.
+    fn message(self) -> Str
+        todo("http2-nv.h2err.H2DecodeError.message")
+
+// Why a value a caller asked to write could not be written.
+//
+// Kept apart from `H2DecodeError` because the two have different
+// audiences: a decode fault is the peer's mistake and is answered with
+// a frame, and an encode fault is the CALLER's mistake and is answered
+// by fixing the call.  A package that merged them would make every host
+// branch on variants that can never happen on its side.
+pub enum H2EncodeError
+    // A DATA payload longer than the negotiated SETTINGS_MAX_FRAME_SIZE.
+    // The caller splits it; this package does not, because splitting is
+    // a flow-control decision and `h2flow.sendable` is where it is made.
+    H2BodyTooLarge(length: Int, max: Int)
+    // A header name that HTTP/2 does not allow: an uppercase letter, an
+    // empty name, or one of `connection`, `keep-alive`,
+    // `proxy-connection`, `transfer-encoding`, `upgrade`.
+    H2NameNotAllowed(name: Str)
+    // A header value with a NUL, a CR or an LF in it.  The refusal is
+    // the response-splitting defence, and it is in the encoder because
+    // that is the only place every caller passes through.
+    H2ValueNotAllowed(name: Str)
+    // A pseudo-header written after a regular one.  § 8.3 requires all
+    // of them first, and a peer receiving them out of order treats the
+    // message as malformed.
+    H2PseudoOutOfOrder(name: Str)
+    // A stream identifier that is zero, negative, above 2^31-1, or the
+    // wrong parity for this endpoint.
+    H2BadStreamNumber(stream: Int)
+    // More bytes than the flow-control window allows.  The caller asks
+    // `h2flow.sendable` first; this is the check that makes forgetting
+    // it a refusal rather than a protocol violation the peer sees.
+    H2WindowTooSmall(want: Int, have: Int)
+    // A PING payload that is not exactly eight bytes.
+    H2BadPingLength(length: Int)
+    // A frame asked for on a connection that has sent or received a
+    // GOAWAY, on a stream above its `last_stream`.
+    H2ConnectionGoingAway(last_stream: Int)
+
+// The standard `Error` implementation, so an encode fault can be
+// reported by anything that reports errors.
+impl Error for H2EncodeError
+    // One line: what the caller asked for and why it cannot be written.
+    fn message(self) -> Str
+        todo("http2-nv.h2err.H2EncodeError.message")
+
+// Is this fault the CONNECTION's, § 5.4.1?
+//
+// THE SINGLE MOST CONSEQUENTIAL PREDICATE IN THIS PACKAGE.  `true`
+// means every stream on the connection is over and the peer is owed a
+// GOAWAY; `false` means one stream is over and the peer is owed a
+// RST_STREAM.  Anything HPACK, anything framing and anything about the
+// connection-level window is the connection's; a bad header on one
+// stream, a wrong state on one stream and that stream's window are the
+// stream's.
+//
+// ```novo
+// use h2err
+//
+// fn main() [io]
+//     println("${h2err.is_connection_fault(H2HpackBadIndex(99, 3))}")
+// ```
+pub fn is_connection_fault(e: H2DecodeError) -> Bool []
+    todo("http2-nv.h2err.is_connection_fault")
+
+// The error code the peer is owed for this fault.
+//
+// Published beside `is_connection_fault` because the two are always
+// asked together — one decides GOAWAY or RST_STREAM, the other decides
+// what goes in it — and a host that got them from two different tables
+// would eventually send a FRAME_SIZE_ERROR in a GOAWAY for a fault that
+// was one stream's.
+//
+// ```novo
+// use h2err
+//
+// fn main() [io]
+//     println(h2err.error_code_name(h2err.code_for(H2BadFrameSize(0x03, 5))))
+// ```
+pub fn code_for(e: H2DecodeError) -> H2ErrorCode []
+    todo("http2-nv.h2err.code_for")
+
+// The stream this fault happened on, or 0 for a connection-scoped one.
+//
+// ```novo
+// use h2err
+//
+// fn main() [io]
+//     println("${h2err.stream_of(H2TooManyStreams(100))}")
+// ```
+pub fn stream_of(e: H2DecodeError) -> Int []
+    todo("http2-nv.h2err.stream_of")

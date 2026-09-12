@@ -1,0 +1,167 @@
+// h2stream_tests.nv — the two half-closed states, the flight in
+// progress, and the identifiers that only go up.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: http2-nv.<module>.<fn>`.
+//
+// THE TRANSITION TABLE IS TESTABLE EXHAUSTIVELY, which is why
+// `state_after` takes no stream and no windows: seven states times nine
+// moves is sixty-three answers, and a suite that walks the interesting
+// ones is worth more than any number of tests that drive a connection
+// and hope.
+
+use std.test
+use h2err
+use h2settings
+use h2stream
+
+@test
+fn test_half_closed_local_and_half_closed_remote_are_not_one_state() [io]
+    // § 5.1.  An implementation with one `HalfClosed` state cannot tell
+    // "I am done talking" from "they are done talking", and the two have
+    // opposite consequences for every subsequent frame.
+    test.case("this endpoint sending END_STREAM half-closes LOCAL")
+    match h2stream.state_after(H2StOpen, H2MoveSendData(true))
+        Err(_) => test.assert(false)
+        Ok(s)  => test.assert(h2stream.send_finished(s))
+
+    test.case("and it may still receive")
+    match h2stream.state_after(H2StOpen, H2MoveSendData(true))
+        Err(_) => test.assert(false)
+        Ok(s)  => test.assert(not h2stream.recv_finished(s))
+
+    test.case("the peer sending END_STREAM half-closes REMOTE")
+    match h2stream.state_after(H2StOpen, H2MoveRecvData(true))
+        Err(_) => test.assert(false)
+        Ok(s)  => test.assert(h2stream.recv_finished(s))
+
+    test.case("and this endpoint may still send")
+    match h2stream.state_after(H2StOpen, H2MoveRecvData(true))
+        Err(_) => test.assert(false)
+        Ok(s)  => test.assert(not h2stream.send_finished(s))
+
+@test
+fn test_a_half_closed_stream_still_sends_three_kinds_of_frame() [io]
+    // WINDOW_UPDATE, PRIORITY and RST_STREAM, § 5.1 — and they are
+    // exactly the three a straightforward reading of the state diagram
+    // refuses.  A client that stopped sending WINDOW_UPDATE after
+    // finishing its request stalls the response it is waiting for.
+    test.case("WINDOW_UPDATE still goes out on a locally half-closed stream")
+    test.assert(h2stream.may_send(H2StHalfClosedLocal, H2KindWindowUpdate))
+
+    test.case("RST_STREAM too")
+    test.assert(h2stream.may_send(H2StHalfClosedLocal, H2KindRstStream))
+
+    test.case("DATA does not")
+    test.assert(not h2stream.may_send(H2StHalfClosedLocal, H2KindData))
+
+    test.case("and the receive side is not the mirror — DATA still arrives")
+    test.assert(h2stream.may_receive(H2StHalfClosedLocal, H2KindData))
+    test.assert(not h2stream.may_receive(H2StHalfClosedRemote, H2KindData))
+
+@test
+fn test_a_reset_stream_tolerates_the_flight_already_on_the_wire() [io]
+    // § 5.1 spends a paragraph on it: after this endpoint sent a
+    // RST_STREAM, the peer's frames that were already on the wire are
+    // not its fault, and answering each one with another RST_STREAM is
+    // how two implementations reset each other until one gives up.
+    test.case("DATA after a local reset is tolerated")
+    test.assert(h2stream.tolerates_after_close(true, H2KindData))
+
+    test.case("a stream that simply finished tolerates less")
+    test.assert(not h2stream.tolerates_after_close(false, H2KindData))
+
+    test.case("and the reset sets the flag the rule reads")
+    match h2stream.advance(h2stream.stream(1, 65535, 65535), H2MoveSendReset)
+        Err(_) => test.assert(false)
+        Ok(s)  =>
+            test.assert(s.local_reset)
+            test.assert(h2stream.is_closed(s.state))
+
+@test
+fn test_data_on_an_idle_stream_is_refused() [io]
+    // A stream begins with HEADERS and nothing else.  A DATA frame on
+    // an idle identifier is a peer that has lost track of what it
+    // opened.
+    test.case("DATA on idle is a fault")
+    match h2stream.state_after(H2StIdle, H2MoveRecvData(false))
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("HEADERS on idle opens it")
+    match h2stream.state_after(H2StIdle, H2MoveRecvHeaders(false))
+        Err(_) => test.assert(false)
+        Ok(s)  => test.assert(not h2stream.is_closed(s))
+
+    test.case("HEADERS with END_STREAM on idle opens and half-closes at once")
+    match h2stream.state_after(H2StIdle, H2MoveRecvHeaders(true))
+        Err(_) => test.assert(false)
+        Ok(s)  => test.assert(h2stream.recv_finished(s))
+
+@test
+fn test_identifiers_only_go_up_and_parity_says_who_opened_it() [io]
+    // § 5.1.1.  A server that saw stream 7 and then stream 5 has a
+    // client that is confused or hostile, and either way the connection
+    // is over — which is why this fault is the connection's and not one
+    // stream's.
+    test.case("a client's identifiers are odd")
+    test.assert(h2stream.is_client_initiated(3))
+    test.assert(not h2stream.is_client_initiated(4))
+
+    test.case("the next one after 3 is 5")
+    test.assert(h2stream.next_client_id(3) == 5)
+
+    test.case("a higher odd identifier from a client is fine")
+    test.assert(h2stream.new_id_ok(5, true, 3))
+
+    test.case("the same one again is not — identifiers are never reused")
+    test.assert(not h2stream.new_id_ok(3, true, 3))
+
+    test.case("nor is a lower one")
+    test.assert(not h2stream.new_id_ok(1, true, 3))
+
+    test.case("nor an even one from a client")
+    test.assert(not h2stream.new_id_ok(4, true, 3))
+
+    test.case("and reuse is the connection's fault, not the stream's")
+    test.assert(h2stream.fault_is_connection(H2StreamIdReused(3, 5)))
+
+@test
+fn test_the_concurrency_limit_answers_refused_stream() [io]
+    // The one code that tells a peer its request was never processed,
+    // so a retry is safe even for a method that is not idempotent.  A
+    // limit that answered PROTOCOL_ERROR would make every conforming
+    // client give up instead of trying elsewhere.
+    test.case("REFUSED_STREAM, which is 7")
+    test.assert(h2err.error_code_num(
+        h2stream.fault_code(H2StreamLimitReached(100))) == 0x07)
+
+    test.case("and it ends one stream rather than the connection")
+    test.assert(not h2stream.fault_is_connection(H2StreamLimitReached(100)))
+
+@test
+fn test_a_goaway_above_this_stream_closes_it_and_makes_it_retryable() [io]
+    // § 6.8: every stream above a GOAWAY's `last_stream` was never
+    // processed.  That is the fact a retry decision rests on, and it is
+    // a state transition rather than a note in a log.
+    test.case("the move closes the stream")
+    match h2stream.state_after(H2StOpen, H2MoveGoAwayAbove)
+        Err(_) => test.assert(false)
+        Ok(s)  => test.assert(h2stream.is_closed(s))
+
+@test
+fn test_both_stream_windows_start_where_the_two_settings_say() [io]
+    // Two initial sizes because they are two different SETTINGS values:
+    // the peer's for what may be sent, this endpoint's own for what may
+    // be received.  A constructor that took one would be right only on a
+    // connection where both peers chose the same number.
+    let s = h2stream.stream(1, 65535, 8192)
+
+    test.case("the send window is the peer's announcement")
+    test.assert(s.send.available == 65535)
+
+    test.case("and the receive window is this endpoint's")
+    test.assert(s.recv.available == 8192)
+
+    test.case("which the protocol's own default makes 65535 before anyone speaks")
+    test.assert(h2settings.default_settings().initial_window_size == 65535)

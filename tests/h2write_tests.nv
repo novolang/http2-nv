@@ -1,0 +1,265 @@
+// h2write_tests.nv — the writing half: frames into a caller's buffer,
+// HPACK strings out of one, and the calls a host makes on a stream.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: http2-nv.<module>.<fn>`.
+//
+// THE WRITER APPENDS TO THE CALLER'S BUFFER AND NEVER ANSWERS ITS OWN
+// ARRAY.  A connection writes a header and its payload into one buffer
+// and issues one write; a package that answered a fresh array per frame
+// would make a hundred small writes out of a hundred frames, and on a
+// device it would make a hundred allocations.  Every `*_into` below is
+// that shape, and the assertions are on what came back.
+
+use std.test
+use std.list
+use h2conn
+use h2err
+use h2frame
+use h2hpack
+use h2prelude
+use h2settings
+use h2stream
+
+fn a_client() -> H2Conn
+    h2conn.client(H2ViaAlpn, h2conn.default_limits(), h2settings.default_settings())
+
+@test
+fn test_a_header_written_is_a_header_read() [io]
+    // Nine bytes out, nine bytes back, and the same four fields.  A
+    // round trip is the cheapest test there is of a bit layout, and the
+    // bit layout is the whole of § 4.1.
+    let h = H2FrameHeader { kind: H2KindPing, flags: 0x01, stream: 0, length: 8 }
+    let out = h2frame.header_into(h, [])
+
+    test.case("nine bytes were appended")
+    test.assert(list.len(out) == 9)
+
+    test.case("and they read back as what went in")
+    match h2frame.header_of_bytes(out, 0)
+        Err(_) => test.assert(false)
+        Ok(b)  =>
+            test.assert(b.length == 8)
+            test.assert(b.stream == 0)
+            test.assert(h2frame.flag_ack(b.kind, b.flags))
+
+@test
+fn test_a_frame_knows_its_own_length_stream_and_kind() [io]
+    // Asked before `frame_into` by a caller sizing a buffer, and by the
+    // flow-control arithmetic to decide whether the frame fits at all.
+    let wu = H2FrameWindowUpdate(1, 4096)
+
+    test.case("a WINDOW_UPDATE payload is four bytes")
+    test.assert(h2frame.frame_length(wu) == 4)
+
+    test.case("on the stream it credits")
+    test.assert(h2frame.frame_stream(wu) == 1)
+
+    test.case("and it knows its own type")
+    test.assert(h2frame.frame_kind_num(h2frame.frame_kind(wu)) == 0x08)
+
+    test.case("a RST_STREAM payload is four bytes too")
+    test.assert(h2frame.frame_length(H2FrameReset(3, H2ErrCancel)) == 4)
+
+@test
+fn test_writing_is_bounded_by_the_remote_frame_size_and_reading_by_the_local_one() [io]
+    // The two directions use different copies of the same parameter,
+    // which is the reason `h2settings` says so loudly that there are
+    // always two.  A decoder checking the peer's limit accepts frames it
+    // had promised to refuse, which is a memory bound given away.
+    test.case("a ping fits the default frame size")
+    match h2frame.frame_into(H2FramePing([], false), 16384, [])
+        Err(_)  => test.assert(false)
+        Ok(out) => test.assert(list.len(out) > 0)
+
+    test.case("and the question is asked against the REMOTE settings")
+    test.assert(h2settings.frame_fits(h2settings.default_settings(), 16384))
+    test.assert(not h2settings.frame_fits(h2settings.default_settings(), 16385))
+
+    test.case("a frame larger than the local limit is a decode fault")
+    match h2frame.frame_of_bytes([0xFF as u8, 0xFF as u8, 0xFF as u8, 0x00 as u8,
+                                  0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+                                  0x01 as u8],
+                                  0, 16384)
+        Ok(_)  => test.assert(false)
+        Err(e) => test.assert(h2err.is_connection_fault(e))
+
+@test
+fn test_the_priority_field_is_five_bytes_and_the_weight_is_the_byte_plus_one() [io]
+    // The single most common off-by-one in a priority implementation:
+    // the field carries 0..255 and means 1..256.  The scheme is
+    // deprecated and the arithmetic still has to be right, because a
+    // relay forwards what it read.
+    test.case("a weight byte of 15 means a weight of 16")
+    match h2frame.priority_of_bytes([0 as u8, 0 as u8, 0 as u8, 0 as u8, 15 as u8], 0)
+        Err(_) => test.assert(false)
+        Ok(p)  =>
+            test.assert(p.weight == 16)
+            test.assert(p.depends_on == 0)
+            test.assert(not p.exclusive)
+
+    test.case("five bytes are required")
+    match h2frame.priority_of_bytes([0 as u8, 0 as u8], 0)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("and 0 is not a stream identifier")
+    test.assert(not h2frame.stream_id_ok(0))
+    test.assert(h2frame.stream_id_ok(h2frame.H2_MAX_STREAM_ID))
+    test.assert(not h2frame.stream_id_ok(h2frame.H2_MAX_STREAM_ID + 1))
+
+    test.case("PADDED is 0x08 on DATA and nowhere on SETTINGS")
+    test.assert(h2frame.flag_padded(H2KindData, 0x08))
+    test.assert(not h2frame.flag_padded(H2KindSettings, 0x08))
+
+@test
+fn test_an_hpack_string_round_trips_with_and_without_huffman() [io]
+    // § 5.2's length byte carries the Huffman flag in its top bit, so
+    // the reader needs nothing but the bytes to know which it is — which
+    // is what makes a round trip a complete test of both paths.
+    test.case("a literal string comes back as itself")
+    match h2hpack.string_of_bytes(h2hpack.string_into("GET", false, []), 0)
+        Err(_) => test.assert(false)
+        Ok(s)  => test.assert(s.text == "GET")
+
+    test.case("and so does a Huffman-coded one")
+    match h2hpack.string_of_bytes(h2hpack.string_into("www.example.com", true, []), 0)
+        Err(_) => test.assert(false)
+        Ok(s)  => test.assert(s.text == "www.example.com")
+
+    test.case("the Huffman writer and reader agree on the length")
+    let coded = h2hpack.huffman_into("www.example.com", [])
+    test.assert(list.len(coded) == 12)
+
+    test.case("and the decode is the identity over it")
+    match h2hpack.huffman_of_bytes(coded, 0, 12)
+        Err(_) => test.assert(false)
+        Ok(s)  => test.assert(s == "www.example.com")
+
+    test.case("padding that is not all ones is refused rather than tolerated")
+    match h2hpack.huffman_of_bytes([0x00 as u8], 0, 1)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_an_encode_threads_the_table_and_a_size_update_comes_first() [io]
+    // An incrementally-indexed header changed the encoder's table, and a
+    // caller that kept the old one desynchronises from its peer on the
+    // very next block.  A dynamic table size update is not a header and
+    // must precede every one of them.
+    test.case("an encode answers the table it left behind")
+    match h2hpack.encode_into(h2hpack.table(4096),
+                              [h2hpack.header(":method", "GET")], [])
+        Err(_) => test.assert(false)
+        Ok(w)  =>
+            test.assert(list.len(w.out) > 0)
+            test.assert(w.table.max_size == 4096)
+
+    test.case("a size update is its own encoding, not a header")
+    test.assert(list.len(h2hpack.table_update_into(4096, [])) > 0)
+
+@test
+fn test_the_upgrade_value_is_base64url_and_the_status_line_is_a_101() [io]
+    // RFC 7540 § 3.2.1.  A caller reaching for a general base64 helper
+    // gets both halves wrong: `+` and `/` are not safe in a header field
+    // and the `=` padding is refused by conforming servers.
+    test.case("the value is not empty for the default settings")
+    test.assert(h2prelude.upgrade_settings_value(h2settings.default_settings()) != "")
+
+    test.case("it round-trips back to the same frame size")
+    match h2prelude.settings_of_upgrade_value(
+            h2prelude.upgrade_settings_value(h2settings.embedded_settings()))
+        Err(_) => test.assert(false)
+        Ok(s)  => test.assert(s.max_frame_size == h2settings.embedded_settings().max_frame_size)
+
+    test.case("and a server accepts with a 101")
+    test.assert(h2prelude.upgrade_accepted_status() == "HTTP/1.1 101 Switching Protocols")
+
+@test
+fn test_every_parameter_and_every_code_has_the_specifications_own_name() [io]
+    // The specification's spelling rather than a prose phrase, because
+    // the token in a log has to be searchable against the RFC a reader
+    // has open beside it.
+    test.case("SETTINGS_MAX_FRAME_SIZE is 0x05")
+    test.assert(h2settings.setting_id_num(H2SetMaxFrameSize) == 0x05)
+
+    test.case("and it is spelled the way § 6.5.2 spells it")
+    test.assert(h2settings.setting_name(H2SetMaxFrameSize) == "SETTINGS_MAX_FRAME_SIZE")
+
+    test.case("FLOW_CONTROL_ERROR likewise")
+    test.assert(h2err.error_code_name(H2ErrFlowControl) == "FLOW_CONTROL_ERROR")
+
+    test.case("a state is spelled as § 5.1 spells it")
+    test.assert(h2stream.state_name(H2StHalfClosedLocal) == "half-closed (local)")
+
+    test.case("and a move names itself for a fault message")
+    test.assert(h2stream.move_name(H2MoveSendReset) != "")
+
+@test
+fn test_a_fault_names_the_stream_it_happened_on() [io]
+    // A decoder fault on a connection carrying a hundred streams is
+    // unactionable without the identifier, and a connection-scoped one
+    // has to say so rather than naming a stream at random.
+    test.case("a stream fault names its stream")
+    test.assert(h2err.stream_of(H2WrongStreamState(7, "closed", 0x00)) == 7)
+
+    test.case("and a connection-scoped one answers 0")
+    test.assert(h2err.stream_of(H2TooManyStreams(100)) == 0)
+
+@test
+fn test_a_server_pushes_on_even_identifiers() [io]
+    // § 5.1.1.  A server that pushed on an odd identifier would be
+    // claiming a number the client owns, and the connection is over.
+    test.case("the first push is stream 2")
+    test.assert(h2stream.next_server_id(0) == 2)
+
+    test.case("and the one after 2 is 4")
+    test.assert(h2stream.next_server_id(2) == 4)
+
+@test
+fn test_the_calls_a_host_makes_on_one_stream() [io]
+    // The six operations grpc-codec-nv's README says a host must
+    // provide, in this package's own vocabulary: open, headers, data,
+    // trailers, reset, and the state to read them against.
+    test.case("a client opens an odd stream")
+    match h2conn.open_stream(a_client())
+        Err(_) => test.assert(false)
+        Ok(o)  => test.assert(h2stream.is_client_initiated(o.stream))
+
+    test.case("and the connection counts it")
+    match h2conn.open_stream(a_client())
+        Err(_) => test.assert(false)
+        Ok(o)  => test.assert(h2conn.open_count(o.conn) == 1)
+
+    test.case("headers on it produce bytes to write")
+    match h2conn.send_headers(a_client(), 1, [h2hpack.header(":method", "POST")], false)
+        Err(_)   => test.assert(false)
+        Ok(step) => test.assert(list.len(step.actions) > 0)
+
+    test.case("trailers close the stream from this side")
+    match h2conn.send_trailers(a_client(), 1, [h2hpack.header("grpc-status", "0")])
+        Err(_)   => test.assert(false)
+        Ok(step) => test.assert(h2stream.send_finished(h2conn.stream_state(step.conn, 1)))
+
+    test.case("a reset closes it altogether")
+    match h2conn.reset_stream(a_client(), 1, H2ErrCancel)
+        Err(_)   => test.assert(false)
+        Ok(step) => test.assert(h2stream.is_closed(h2conn.stream_state(step.conn, 1)))
+
+    test.case("and a stream nobody opened is idle rather than an error")
+    test.assert(not h2stream.is_closed(h2conn.stream_state(a_client(), 99)))
+
+@test
+fn test_new_settings_do_not_take_effect_until_the_peer_acknowledges() [io]
+    // § 6.5.3, and the rule a straightforward implementation gets
+    // backwards: an endpoint that applied its own new
+    // SETTINGS_INITIAL_WINDOW_SIZE immediately would accept data against
+    // a window the peer has not started using.
+    let after = h2conn.announce(a_client(), h2settings.embedded_settings(), 10000)
+
+    test.case("the frame goes out")
+    test.assert(list.len(after.actions) > 0)
+
+    test.case("and the local settings are still the old ones")
+    test.assert(h2conn.local_settings(after.conn).max_frame_size ==
+                h2settings.default_settings().max_frame_size)

@@ -1,0 +1,185 @@
+// h2conn_tests.nv — the connection as a value: the preface, the two
+// settings copies, the partial send, and the credit a host forgets.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: http2-nv.<module>.<fn>`.
+//
+// AND THE COMPILER MAKES THE FIRST ASSERTION.  Every function driven
+// here is `[]`, and the driving functions below carry no effect row at
+// all — so the claim that an HTTP/2 connection can be advanced without
+// performing anything is checked before the run starts.
+
+use std.test
+use std.list
+use h2conn
+use h2prelude
+use h2settings
+
+// A client that has said nothing yet.
+fn a_client() -> H2Conn
+    h2conn.client(H2ViaAlpn, h2conn.default_limits(), h2settings.default_settings())
+
+// A server that has heard nothing yet.
+fn a_server() -> H2Conn
+    h2conn.server(H2ViaPriorKnowledge, h2conn.default_limits(),
+                  h2settings.default_settings())
+
+// Driving a connection costs NOTHING, and this signature is the proof.
+// A host adds `[io]` around it; the protocol itself adds none.
+fn advance(c: H2Conn, chunk: [u8]) -> Result<H2Step, H2DecodeError>
+    h2conn.feed(c, chunk)
+
+@test
+fn test_a_client_sends_the_preface_and_its_settings_without_waiting() [io]
+    // § 3.4.  A client that waited for the server's SETTINGS before
+    // sending its own adds a round trip to every connection, and the
+    // specification does not ask for it.
+    test.case("the preface is twenty-four bytes")
+    test.assert(h2prelude.H2_PREFACE_LEN == 24)
+    test.assert(list.len(h2prelude.connection_preface()) == 24)
+
+    test.case("a client's first step has bytes to write")
+    test.assert(list.len(h2conn.start(a_client()).actions) > 0)
+
+    test.case("and it has learned nothing yet")
+    test.assert(list.len(h2conn.start(a_client()).events) == 0)
+
+@test
+fn test_a_partial_preface_is_waiting_and_a_wrong_one_is_an_http1_client() [io]
+    // The distinction § 3.4 rests on: a server MAY answer a plain
+    // HTTP/1.1 client with a 400 it can read, rather than a GOAWAY it
+    // cannot.  A predicate that answered false for both cannot make it.
+    test.case("two correct bytes so far is not a fault")
+    match h2prelude.preface_fault([0x50 as u8, 0x52 as u8])
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+
+    test.case("but GET is wrong at the second byte")
+    match h2prelude.preface_fault([0x47 as u8, 0x45 as u8, 0x54 as u8])
+        None     => test.assert(false)
+        Some(at) => test.assert(at == 1)
+
+    test.case("and the whole preface is accepted")
+    test.assert(h2prelude.preface_ok(h2prelude.connection_preface()))
+
+@test
+fn test_the_two_settings_copies_are_different_numbers() [io]
+    // Each peer ANNOUNCES what it will accept and the other obeys, so
+    // there are always two values for every parameter.  A connection
+    // that kept one sends frames the peer refuses, and the symptom
+    // arrives as a GOAWAY minutes later.
+    let c = h2conn.client(H2ViaAlpn, h2conn.default_limits(),
+                          h2settings.embedded_settings())
+
+    test.case("local is what this endpoint announced")
+    test.assert(h2conn.local_settings(c).max_frame_size ==
+                h2settings.embedded_settings().max_frame_size)
+
+    test.case("remote starts at the protocol's defaults, not at local")
+    test.assert(h2conn.remote_settings(c).max_frame_size == 16384)
+
+    test.case("and the protocol's default frame size is the floor a peer must accept")
+    test.assert(h2settings.default_settings().max_frame_size == 16384)
+
+@test
+fn test_send_data_takes_what_the_window_allows_and_says_how_much() [io]
+    // A `send_data` that answered `Unit` would either block — which a
+    // `core` package cannot do — or silently buffer the remainder,
+    // which is an unbounded queue with no name.  `taken` is the whole
+    // of flow control from a caller's side.
+    test.case("a fresh stream's send window is the peer's initial window")
+    test.assert(h2conn.send_window(a_client(), 1) <= 65535)
+
+    test.case("and a send answers how many bytes it took")
+    match h2conn.send_data(a_client(), 1, [], true)
+        Err(_) => test.assert(false)
+        Ok(s)  => test.assert(s.taken == 0)
+
+@test
+fn test_a_host_that_never_calls_delivered_transfers_one_window_and_stops() [io]
+    // The single most common "HTTP/2 is slow" report.  The window
+    // shrank when the bytes ARRIVED and reopens only when they have
+    // been read, so a host that never reports delivery never credits.
+    test.case("delivering below the threshold owes nothing yet")
+    test.assert(list.len(h2conn.delivered(a_server(), 1, 8).actions) == 0)
+
+    test.case("and the divisor the default policy uses is 2")
+    test.assert(h2conn.default_limits().update_divisor == 2)
+
+@test
+fn test_a_goaway_says_which_streams_were_never_processed() [io]
+    // § 6.8.  Every stream ABOVE `last_stream` was never looked at,
+    // which is the one condition that makes re-sending a
+    // non-idempotent request safe.  grpc-nv asks exactly this question
+    // of its transport and answers it today from a fault type it
+    // invents; with this package underneath, the two agree by
+    // construction.
+    test.case("a connection with no GOAWAY answers None")
+    match h2conn.goaway_last_stream(a_client())
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+
+    test.case("and nothing is known to be unprocessed")
+    test.assert(not h2conn.never_processed(a_client(), 9))
+
+    test.case("sending a GOAWAY closes the connection to new streams")
+    let after = h2conn.go_away(a_client(), H2ErrNoError, "")
+    test.assert(not h2conn.is_open(after.conn))
+
+    test.case("and the action list says to close after writing it")
+    test.assert(list.len(after.actions) > 0)
+
+@test
+fn test_a_ping_payload_that_is_not_eight_bytes_is_refused() [io]
+    // A peer's ACK echoes what it received, so a caller matching on
+    // what it sent would never find a padded payload again.
+    test.case("an empty payload is refused rather than padded")
+    match h2conn.ping(a_client(), [])
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_feeding_nothing_is_not_a_fault() [io]
+    // On a socket, a chunk that completes no frame is the ordinary
+    // case.  A codec that reported it as an error would have every
+    // caller filtering one variant out of its logs for ever.
+    test.case("an empty chunk produces no events and no actions")
+    match advance(a_client(), [])
+        Err(_)   => test.assert(false)
+        Ok(step) =>
+            test.assert(list.len(step.events) == 0)
+            test.assert(list.len(step.actions) == 0)
+
+    test.case("and nothing is pending")
+    test.assert(h2conn.pending_bytes(a_client()) == 0)
+
+@test
+fn test_a_fault_answers_frames_as_well_as_a_verdict() [io]
+    // `feed`'s error arm carries one value and the answer to a fault is
+    // two: the frames the peer is owed, and a connection that has
+    // recorded which.  A host that skipped this and closed the socket
+    // leaves the peer to time out.
+    test.case("an HPACK fault produces a GOAWAY to write")
+    let after = h2conn.fault_actions(a_client(), H2HpackBadIndex(99, 3))
+    test.assert(list.len(after.actions) > 0)
+
+    test.case("and the connection is over")
+    test.assert(not h2conn.is_open(after.conn))
+
+    test.case("a stream fault leaves the connection open")
+    let one = h2conn.fault_actions(a_client(), H2WrongStreamState(3, "closed", 0x00))
+    test.assert(h2conn.is_open(one.conn))
+
+@test
+fn test_the_embedded_limits_are_named_rather_than_invented_per_caller() [io]
+    // The number that matters on a microcontroller is the one that fits
+    // beside everything else in 64 KiB of RAM, and every caller
+    // inventing it separately gets a different answer.
+    test.case("four tracked streams")
+    test.assert(h2conn.embedded_limits().max_tracked_streams == 4)
+
+    test.case("and settings to match")
+    test.assert(h2settings.embedded_settings().max_concurrent_streams == 4)
+
+    test.case("with push off, because a device has nowhere to put one")
+    test.assert(not h2settings.embedded_settings().enable_push)

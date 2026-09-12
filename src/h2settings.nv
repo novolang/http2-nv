@@ -1,0 +1,294 @@
+// h2settings.nv — the six parameters two peers agree on, and the one
+// piece of arithmetic everybody gets wrong.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// SETTINGS ARE NOT A HANDSHAKE, and reading them as one is the first
+// mistake.  Each peer ANNOUNCES what it will accept and the other peer
+// obeys, so there are always TWO settings values in play for every
+// parameter and they are not equal: `local` is what this endpoint will
+// accept and `remote` is what the peer will accept.  A connection that
+// kept one copy sends frames the peer refuses, and the symptom arrives
+// as a GOAWAY with FRAME_SIZE_ERROR minutes later.  `h2conn` holds both
+// and never conflates them.
+//
+// THE ARITHMETIC NOBODY GETS RIGHT IS § 6.9.2.  A SETTINGS frame that
+// changes SETTINGS_INITIAL_WINDOW_SIZE changes the flow-control window
+// of every stream that is ALREADY OPEN, by the difference, retroactively
+// — and the new window may be negative, which is legal and which a
+// sender must respect by sending nothing until a WINDOW_UPDATE lifts it
+// back above zero.  An implementation that applies the new value only to
+// streams opened afterwards deadlocks against a peer that shrank its
+// window, and one that clamps the negative result to zero sends bytes
+// the peer will count as a flow-control error.  `window_delta` is that
+// difference, published as its own function with its own test, because
+// it is one subtraction that three other modules have to agree about.
+//
+// UNKNOWN IDENTIFIERS ARE IGNORED, NOT REFUSED.  § 6.5.2 says an
+// endpoint that receives a SETTINGS parameter it does not understand
+// MUST ignore it — that is the extension point the protocol is
+// versioned through, and refusing one breaks against every peer that
+// implements something newer.  `H2SetUnknown` carries the number so a
+// relay can pass it on and a log can name it.
+//
+// NOTHING HERE PERFORMS ANYTHING.  Every row in this module is `[]`.
+
+// A settings parameter identifier, RFC 9113 § 6.5.2.
+pub enum H2SettingId
+    // 0x01 — the largest HPACK dynamic table the sender will accept.
+    H2SetHeaderTableSize
+    // 0x02 — whether the sender will accept PUSH_PROMISE.  A client
+    // that sets 0 and then receives a push is entitled to a connection
+    // error, and every browser has set 0 since 2022.
+    H2SetEnablePush
+    // 0x03 — how many streams the sender will have open at once.
+    H2SetMaxConcurrentStreams
+    // 0x04 — the flow-control window the sender gives each new stream.
+    H2SetInitialWindowSize
+    // 0x05 — the largest frame payload the sender will accept.
+    H2SetMaxFrameSize
+    // 0x06 — advisory: the largest header list the sender will accept,
+    // measured with HPACK's own per-entry overhead of 32.
+    H2SetMaxHeaderListSize
+    // Anything else.  § 6.5.2 requires it to be IGNORED, and the number
+    // is kept so a relay can pass it on unchanged.
+    H2SetUnknown(id: Int)
+
+// One parameter and the value announced for it.
+pub struct H2Setting
+    id: H2SettingId
+    value: Int
+
+// The six parameters, resolved.
+//
+// A struct rather than the list, because the list is what travels and
+// this is what a decision is made against: a sender asking "how large
+// may this frame be" wants one field, not a search through entries that
+// may or may not be present.  `apply` turns one into the other.
+//
+// `enable_push` is a `Bool` even though the wire carries 0 or 1,
+// because the wire's third value is a connection error and a type that
+// can hold it is a type somebody will pass it in.
+pub struct H2Settings
+    header_table_size: Int
+    enable_push: Bool
+    max_concurrent_streams: Int
+    initial_window_size: Int
+    max_frame_size: Int
+    max_header_list_size: Int
+
+// The parameter identifier as the number on the wire.
+//
+// ```novo
+// use h2settings
+//
+// fn main() [io]
+//     println("${h2settings.setting_id_num(H2SetMaxFrameSize)}")
+// ```
+pub fn setting_id_num(id: H2SettingId) -> Int []
+    todo("http2-nv.h2settings.setting_id_num")
+
+// The parameter a number names, or `H2SetUnknown` with the number.
+//
+// ```novo
+// use h2settings
+//
+// fn main() [io]
+//     println(h2settings.setting_name(h2settings.setting_id_of_num(0x04)))
+// ```
+pub fn setting_id_of_num(n: Int) -> H2SettingId []
+    todo("http2-nv.h2settings.setting_id_of_num")
+
+// The specification's own spelling — `"SETTINGS_MAX_FRAME_SIZE"`.
+//
+// ```novo
+// use h2settings
+//
+// fn main() [io]
+//     println(h2settings.setting_name(H2SetEnablePush))
+// ```
+pub fn setting_name(id: H2SettingId) -> Str []
+    todo("http2-nv.h2settings.setting_name")
+
+// The values RFC 9113 § 6.5.2 gives before either peer has spoken.
+//
+// A table of 4096, push enabled, no concurrency limit, a 65535-byte
+// window, a 16384-byte frame and no header-list limit.  Every one of
+// them is the protocol's own default and not a choice this package
+// made, which is why they are here rather than in each caller.
+//
+// ```novo
+// use h2settings
+//
+// fn main() [io]
+//     println("${h2settings.default_settings().initial_window_size}")
+// ```
+pub fn default_settings() -> H2Settings []
+    todo("http2-nv.h2settings.default_settings")
+
+// What a microcontroller announces: a 512-byte HPACK table, push off,
+// four concurrent streams, an 8 KiB window, the minimum frame size and
+// a 2 KiB header-list ceiling.
+//
+// Named here rather than left to each device caller to invent, for the
+// same reason `http-codec-nv` names its own: the number that matters on
+// a device is the one that fits beside everything else in 64 KiB of
+// RAM, and every caller inventing it separately gets a different
+// answer.  A peer that respects these needs no allocator on the device
+// side of the connection.
+//
+// ```novo
+// use h2settings
+//
+// fn main() [io]
+//     println("${h2settings.embedded_settings().max_concurrent_streams}")
+// ```
+pub fn embedded_settings() -> H2Settings []
+    todo("http2-nv.h2settings.embedded_settings")
+
+// The number `max_concurrent_streams` holds when the peer announced no
+// limit, which is -1.
+//
+// -1 rather than a large number, for the reason grpc-codec-nv gives for
+// its own message counts: a comparison against a large number can be
+// made to pass by a peer opening enough streams, and a comparison
+// against -1 cannot.
+//
+// ```novo
+// use h2settings
+//
+// fn main() [io]
+//     println("${h2settings.unlimited()}")
+// ```
+pub fn unlimited() -> Int []
+    todo("http2-nv.h2settings.unlimited")
+
+// Is this value legal for this parameter, § 6.5.2?
+//
+// ENABLE_PUSH must be 0 or 1; INITIAL_WINDOW_SIZE must not exceed
+// 2^31-1; MAX_FRAME_SIZE must be between 16384 and 16777215.  Everything
+// else is unconstrained, and an unknown identifier is always legal
+// because it is ignored.
+//
+// ```novo
+// use h2settings
+//
+// fn main() [io]
+//     println("${h2settings.value_ok(H2SetMaxFrameSize, 1024)}")
+// ```
+pub fn value_ok(id: H2SettingId, value: Int) -> Bool []
+    todo("http2-nv.h2settings.value_ok")
+
+// The settings with one parameter applied, or the fault that value is.
+//
+// An unknown identifier applies as a no-op and answers `Ok`, because
+// § 6.5.2 requires it to be ignored rather than refused.
+//
+// ```novo
+// use h2settings
+//
+// fn main() [io]
+//     match h2settings.apply(h2settings.default_settings(),
+//                            H2Setting { id: H2SetMaxFrameSize, value: 32768 })
+//         Ok(s)  => println("${s.max_frame_size}")
+//         Err(e) => println(e.message())
+// ```
+pub fn apply(s: H2Settings, one: H2Setting) -> Result<H2Settings, H2DecodeError> []
+    todo("http2-nv.h2settings.apply")
+
+// The settings with a whole frame's worth applied, in order.
+//
+// In order, and the order matters: § 6.5 allows the same identifier
+// twice in one frame and says the last one wins, so a fold that
+// short-circuited on the first occurrence would resolve the wrong
+// value.  Stops at the first illegal value, because a SETTINGS frame
+// with one bad parameter is a connection error and the rest of it will
+// never be acted on.
+//
+// ```novo
+// use h2settings
+//
+// fn main() [io]
+//     match h2settings.apply_all(h2settings.default_settings(), [])
+//         Ok(s)  => println("${s.max_frame_size}")
+//         Err(e) => println(e.message())
+// ```
+pub fn apply_all(s: H2Settings, list: [H2Setting]) -> Result<H2Settings, H2DecodeError> []
+    todo("http2-nv.h2settings.apply_all")
+
+// Every parameter as an entry, in identifier order.
+//
+// What a peer announcing its whole position writes.  Identifier order
+// rather than the order a caller set them, so two endpoints that agree
+// produce byte-identical SETTINGS frames and a recorded conversation
+// can be compared.
+//
+// ```novo
+// use std.list
+// use h2settings
+//
+// fn main() [io]
+//     println("${list.len(h2settings.to_list(h2settings.default_settings()))}")
+// ```
+pub fn to_list(s: H2Settings) -> [H2Setting] []
+    todo("http2-nv.h2settings.to_list")
+
+// Only the parameters that differ from `from`, in identifier order.
+//
+// The frame a peer actually sends: announcing six parameters when one
+// changed costs thirty-six bytes on every reconfiguration and tells a
+// reader of a packet capture nothing about what moved.
+//
+// ```novo
+// use std.list
+// use h2settings
+//
+// fn main() [io]
+//     let d = h2settings.default_settings()
+//     println("${list.len(h2settings.diff(d, d))}")
+// ```
+pub fn diff(from: H2Settings, to: H2Settings) -> [H2Setting] []
+    todo("http2-nv.h2settings.diff")
+
+// How much every OPEN stream's send window moves when the peer's
+// SETTINGS_INITIAL_WINDOW_SIZE changes from `old_initial` to
+// `new_initial`, § 6.9.2.
+//
+// THE SUBTRACTION THIS MODULE EXISTS FOR.  The change is retroactive:
+// a stream that already has 30000 bytes of credit against a 65535-byte
+// initial window has 30000 - 35535 = -5535 after the peer announces
+// 30000, and a NEGATIVE window is legal.  The sender sends nothing
+// until WINDOW_UPDATE frames lift it back above zero.
+//
+// Two ways to be wrong, both of which look fine in a test against a
+// peer that never changes its settings: applying the new value only to
+// streams opened afterwards deadlocks against a peer that shrank, and
+// clamping the negative result to zero sends bytes the peer counts as
+// a flow-control error and answers with a GOAWAY.
+//
+// Published as one function so `h2flow.retune`, `h2conn` and a host
+// that keeps its own accounting cannot come to three different answers.
+//
+// ```novo
+// use h2settings
+//
+// fn main() [io]
+//     println("${h2settings.window_delta(65535, 30000)}")
+// ```
+pub fn window_delta(old_initial: Int, new_initial: Int) -> Int []
+    todo("http2-nv.h2settings.window_delta")
+
+// Does a frame of this many payload bytes fit what the peer announced?
+//
+// The question `h2frame.frame_into`'s caller asks, published because
+// the comparison is against the REMOTE settings and a caller holding
+// both copies reaches for the wrong field about half the time.
+//
+// ```novo
+// use h2settings
+//
+// fn main() [io]
+//     println("${h2settings.frame_fits(h2settings.default_settings(), 20000)}")
+// ```
+pub fn frame_fits(remote: H2Settings, payload_len: Int) -> Bool []
+    todo("http2-nv.h2settings.frame_fits")
