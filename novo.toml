@@ -1,7 +1,7 @@
 [package]
 name        = "http2-nv"
 license     = "Apache-2.0"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "HTTP/2 as a connection value a host pumps: the ten frame types to and from bytes, HPACK with its static table, its Huffman code and a dynamic table the caller sizes, the seven-state stream machine, connection and stream flow control as arithmetic, settings, and the ALPN, prior-knowledge and h2c preludes.  Sans-IO: every call answers the events the host learned and the actions it must perform, and nothing here touches a socket.  Interface only — every body is a todo()."
 
 # `license` sits immediately after the name, before any value that could
