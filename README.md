@@ -177,7 +177,7 @@ specification the implementation will have to satisfy.
 | `h2flow` | Flow control as arithmetic on two integers: what may be sent, what a send costs, and the credit a receiver owes. |
 | `h2settings` | The six parameters, the values that are refused, and the retroactive window change a new initial window size causes. |
 | `h2prelude` | ALPN, prior knowledge and the h2c upgrade, as values. The 24-byte preface and the `HTTP2-Settings` header. |
-| `h2err` | The thirteen error codes, the decode and encode faults, and whether a fault ends one stream or the whole connection. |
+| `h2err` | The fourteen error codes, the decode and encode faults, and whether a fault ends one stream or the whole connection. |
 
 ## How to choose an entry point
 
